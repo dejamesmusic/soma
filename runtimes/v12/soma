@@ -1,0 +1,206 @@
+#!/usr/bin/env sh
+#
+# soma — bootstrap and run.
+#
+# On first run:
+#   - verifies python3 is present (factory macOS has it)
+#   - creates a local virtualenv at ./venv
+#   - installs numpy + torch (~300MB download, one-time)
+#
+# On every run, after bootstrap:
+#   ./soma                  interactive CLI (train/eval/chat)
+#   ./soma stream <args>    run wikistream (rolling wiki corpus)
+#   ./soma loop <args>      run soma_loop (perpetual training)
+#
+# Designed to work on a factory macOS install with no Homebrew, no
+# Xcode tools, no prior Python setup. Uses only what ships with macOS.
+#
+
+set -e
+cd "$(dirname "$0")"
+
+# ── styling ──
+if [ -t 1 ]; then
+    DIM='\033[2m'; BOLD='\033[1m'; RESET='\033[0m'
+else
+    DIM=''; BOLD=''; RESET=''
+fi
+say() { printf "${DIM}  • %s${RESET}\n" "$1"; }
+err() { printf "  ! %s\n" "$1" >&2; }
+
+# ── 1. python ──
+# Prefer the system Python at /usr/bin/python3 over whatever's on PATH.
+# Reason: macOS's system Python ships with tkinter built in, while
+# Homebrew's Python often doesn't (requires `brew install python-tk`).
+# The launcher works either way, but defaulting to the system one means
+# the GUI works out of the box on a developer's machine without extra
+# brew installs. If the system Python isn't present (very rare), fall
+# back to whatever's on PATH.
+if [ -x "/usr/bin/python3" ]; then
+    PY_BIN="/usr/bin/python3"
+elif command -v python3 >/dev/null 2>&1; then
+    PY_BIN="$(command -v python3)"
+else
+    err "python3 not found."
+    err "macOS ships python3 by default — if it's missing, install"
+    err "the command-line tools with: xcode-select --install"
+    exit 1
+fi
+
+PY_VERSION=$("$PY_BIN" -c "import sys; print(f'{sys.version_info[0]}.{sys.version_info[1]}')")
+PY_MAJOR=$(echo "$PY_VERSION" | cut -d. -f1)
+PY_MINOR=$(echo "$PY_VERSION" | cut -d. -f2)
+if [ "$PY_MAJOR" -lt 3 ] || { [ "$PY_MAJOR" -eq 3 ] && [ "$PY_MINOR" -lt 8 ]; }; then
+    err "python 3.8+ required; found $PY_VERSION at $PY_BIN"
+    exit 1
+fi
+
+# ── 2. venv ──
+VENV_DIR="venv"
+VENV_PY="$VENV_DIR/bin/python"
+
+if [ ! -x "$VENV_PY" ]; then
+    say "first run — creating local virtualenv from $PY_BIN"
+    "$PY_BIN" -m venv "$VENV_DIR"
+fi
+
+# ── 3. dependencies ──
+if ! "$VENV_PY" -c "import torch, numpy" >/dev/null 2>&1; then
+    say "installing dependencies (torch + numpy, ~300MB on first run)"
+    say "this will take a few minutes; pip's progress will show below"
+    "$VENV_PY" -m pip install --upgrade pip
+    "$VENV_PY" -m pip install -r requirements.txt
+    say "dependencies installed"
+fi
+
+# ── 4. data dirs ──
+# convention: bare filenames in the cli refer to these dirs.
+# users typing "priant.pt" get checkpoints/priant.pt; typing
+# "data/enwik9" or an absolute path bypasses the convention.
+#
+# also ensure streams/ exists (where users drop new stream scripts)
+# and data/streams/ (where stream output files live, separate from
+# user-supplied corpora).
+mkdir -p data data/streams checkpoints streams
+
+# ── 5. dispatch ──
+SUBCMD="${1:-}"
+case "$SUBCMD" in
+    gui)
+        # Verify tkinter is importable before launching the gui.
+        # On a stock macOS install with the system Python, this is a
+        # given. With a Homebrew Python, tkinter is a separate install
+        # (`brew install python-tk`) and we want a clear instruction
+        # rather than a python traceback.
+        if ! "$VENV_PY" -c "import tkinter" >/dev/null 2>&1; then
+            err "tkinter is not available in this python."
+            err ""
+            err "the venv was built from: $("$VENV_PY" -c \
+                'import sys; print(sys.base_prefix)')"
+            err ""
+            err "two ways to fix:"
+            err ""
+            err "  A) install tkinter for the python the venv uses:"
+            err "       brew install python-tk"
+            err "     (find the matching version with: $VENV_PY --version)"
+            err ""
+            err "  B) rebuild the venv on top of macOS's system python,"
+            err "     which ships with tkinter built in:"
+            err "       rm -rf venv"
+            err "       ./soma gui"
+            err "     (the launcher will recreate it from /usr/bin/python3)"
+            err ""
+            exit 1
+        fi
+        exec "$VENV_PY" soma_gui.py
+        ;;
+    stream)
+        shift
+        # Default behaviour: run the only available stream, or list them
+        # if there's more than one. Explicit: ./soma stream <name> [args].
+        # Streams that get no corpus arg write to data/streams/<name>.txt
+        # by default — see _default_stream_corpus in each stream module.
+        if [ "$#" -eq 0 ]; then
+            STREAM_COUNT=$("$VENV_PY" -c "
+from streams_registry import list_streams
+print(len(list_streams()))
+")
+            if [ "$STREAM_COUNT" = "1" ]; then
+                STREAM_PATH=$("$VENV_PY" -c "
+from streams_registry import list_streams
+print(list_streams()[0]['path'])
+")
+                exec "$VENV_PY" "$STREAM_PATH"
+            else
+                "$VENV_PY" streams_registry.py
+                err ""
+                err "specify which: ./soma stream <name> [corpus]"
+                exit 1
+            fi
+        else
+            STREAM_NAME="$1"; shift
+            STREAM_PATH=$("$VENV_PY" -c "
+from streams_registry import find_stream
+s = find_stream('$STREAM_NAME')
+print(s['path'] if s else '')
+")
+            if [ -z "$STREAM_PATH" ]; then
+                err "unknown stream: $STREAM_NAME"
+                err ""
+                "$VENV_PY" streams_registry.py
+                exit 1
+            fi
+            # remaining args (if any) pass through; missing corpus → 
+            # the stream uses its default location
+            exec "$VENV_PY" "$STREAM_PATH" "$@"
+        fi
+        ;;
+    streams)
+        exec "$VENV_PY" streams_registry.py
+        ;;
+    loop)
+        shift
+        if [ "$#" -lt 2 ]; then
+            err "usage: ./soma loop <corpus> <checkpoint> [flags]"
+            err "example: ./soma loop corpus.txt model.pt --hidden 2048"
+            exit 1
+        fi
+        exec "$VENV_PY" soma_loop.py "$@"
+        ;;
+    test)
+        shift
+        say "running test suite"
+        exec "$VENV_PY" test_soma.py "$@"
+        ;;
+    help|--help|-h)
+        cat <<EOF
+
+  ░▒▓ soma ▓▒░  launcher
+
+  ./soma                       interactive CLI (train, eval, chat)
+  ./soma gui                   launch the gui
+  ./soma stream [name] [path]  run a stream (lists available if ambiguous)
+  ./soma streams               list available streams
+  ./soma loop  <c> <m>         perpetual training on rolling corpus
+  ./soma test                  run correctness tests
+  ./soma help                  this message
+
+  see README.md for details.
+
+EOF
+        exit 0
+        ;;
+    "")
+        # no subcommand: launch interactive CLI
+        printf "${BOLD}\n"
+        cat <<'BANNER'
+  ░▒▓ soma ▓▒░
+BANNER
+        printf "${RESET}\n"
+        exec "$VENV_PY" soma_v12.py
+        ;;
+    *)
+        # unknown subcommand: forward all args to soma_v12.py
+        exec "$VENV_PY" soma_v12.py "$@"
+        ;;
+esac
