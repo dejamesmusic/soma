@@ -47,6 +47,7 @@ class Worker:
         self.dream_length = "200"
         self.dream_temperature = 0.8
         self.start_byte = 0
+        self.runtime = None
 
     def read_stop(self):
         if not self.stop_path.exists():
@@ -86,6 +87,7 @@ class Worker:
         except Exception as e:
             emit("error", f"import failed: {e}")
             return
+        self.runtime = soma_runtime
 
         try:
             emit("start")
@@ -281,7 +283,7 @@ class Worker:
                     "epochs": int(epochs),
                     "lr": float(getattr(model, "lr", 0.001)),
                     "auto_mode": getattr(
-                        model, "auto_mode", soma_runtime.DEFAULT_AUTO_MODE),
+                        model, "auto_mode", self.runtime.DEFAULT_AUTO_MODE),
                     "grad_clip": float(getattr(model, "grad_clip", 1.0)),
                     "decimation_band": float(getattr(model, "decimation_band", 0.0)),
                     "stride": int(getattr(model, "_stride", 1)),
