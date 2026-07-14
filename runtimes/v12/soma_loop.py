@@ -22,9 +22,9 @@ shifts (new event, new topic, new vocabulary), soma drifts to match.
 Usage:
     python soma_loop.py corpus.txt model.pt [--head-bytes 50000000]
                                             [--cycle-pause 60]
-                                            [--soma-dir /path/to/soma_v12]
+                                            [--soma-dir /path/to/soma_v12.1]
 
-The script imports soma_v12 from --soma-dir (or the same directory by
+The script imports soma_v12_1 from --soma-dir (or the same directory by
 default) and uses its SOMA class directly. No subprocess overhead.
 
 Press Ctrl-C to stop cleanly between cycles. If you stop mid-cycle the
@@ -76,7 +76,7 @@ def _on_sigint(signum, frame):
 
 
 def setup_soma_path(soma_dir):
-    """Make soma_v12 importable from the given directory."""
+    """Make soma_v12_1 importable from the given directory."""
     if soma_dir:
         sys.path.insert(0, str(soma_dir))
     else:
@@ -117,7 +117,7 @@ def load_or_build_soma(soma_v12, ckpt_path, head_temp_path, *,
             ckpt.get('n_bands', n_bands),
             base=ckpt.get('base', base),
             hidden_dim=ckpt.get('hidden_dim', hidden_dim),
-            n_layers=ckpt.get('n_layers', n_layers),
+            n_layers=ckpt.get('n_stacks', ckpt.get('n_layers', n_layers)),
             lr=ckpt.get('lr', lr),
             max_change=ckpt.get('max_change', max_change),
             weight_decay=ckpt.get('weight_decay', weight_decay),
@@ -173,19 +173,20 @@ def main():
                    help="don't start training until corpus has at least "
                         "this many bytes (default 1M)")
     p.add_argument("--soma-dir", type=str, default=None,
-                   help="directory containing soma_v12.py (default: same "
+                   help="directory containing soma_v12_1.py (default: same "
                         "as this script)")
 
     # model build flags — only used when no checkpoint exists yet
-    p.add_argument("--bands", type=int, default=32)
-    p.add_argument("--hidden", type=int, default=1024)
-    p.add_argument("--layers", type=int, default=3)
+    p.add_argument("--bands", type=int, default=16)
+    p.add_argument("--hidden", type=int, default=1536)
+    p.add_argument("--layers", type=int, default=2,
+                   help="belief stacks")
     p.add_argument("--base", type=float, default=1.6180)
-    p.add_argument("--lr", type=str, default="spectral 1.0",
+    p.add_argument("--lr", type=str, default="auto",
                    help="initial lr (literal or 'auto'/'auto N')")
-    p.add_argument("--max-change", type=str, default="spectral 1.0")
+    p.add_argument("--max-change", type=str, default="auto")
     p.add_argument("--weight-decay", type=float, default=0.0)
-    p.add_argument("--batch", type=int, default=256)
+    p.add_argument("--batch", type=int, default=512)
     p.add_argument("--decimation", type=float, default=1.0,
                    help="adaptive decimation range fraction in [0, 1]")
 
@@ -201,7 +202,7 @@ def main():
 
     # parse lr / max_change for auto support — replicates soma's CLI parser
     setup_soma_path(args.soma_dir)
-    import soma_v12  # noqa
+    import soma_v12_1 as soma_v12  # noqa
 
     lr_val, lr_auto, lr_base = soma_v12._parse_auto_or_float(args.lr)
     mc_val, mc_auto, mc_base = soma_v12._parse_auto_or_float(args.max_change)
@@ -210,7 +211,7 @@ def main():
                  else ('full spectrum' if 'full spectrum' in auto_tokens
                  else ('spectral' if 'spectral' in auto_tokens
                        else ('progress' if 'progress' in auto_tokens
-                             else 'level'))))
+                             else 'io2'))))
 
     # Build or load model
     model = load_or_build_soma(

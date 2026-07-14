@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""resumable soma v12 cloud trainer.
+"""resumable soma v12.1 cloud trainer.
 
 designed for vast/ssh runs:
 - writes metrics.jsonl, dreams.txt, status.json
@@ -25,7 +25,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import soma_v12
+import soma_v12_1 as soma_v12
 
 
 def parse_auto(text, default_mode=None, default_value=1.0):
@@ -89,7 +89,7 @@ def build_model(args):
         n_bands=args.bands,
         base=args.base,
         hidden_dim=args.hidden,
-        n_layers=args.layers,
+        n_stacks=args.layers,
         direct_readout=False,
         scale_gate=False,
         clock=1,
@@ -116,7 +116,7 @@ def load_or_create(args, ckpt):
             cfg.get("n_bands", args.bands),
             base=cfg.get("base", args.base),
             hidden_dim=cfg.get("hidden_dim", args.hidden),
-            n_layers=cfg.get("n_layers", args.layers),
+            n_stacks=cfg.get("n_stacks", cfg.get("n_layers", args.layers)),
             direct_readout=bool(cfg.get("direct_readout", False)),
             scale_gate=bool(cfg.get("scale_gate", False)),
             clock=cfg.get("clock", 1),
@@ -211,7 +211,7 @@ def train(args):
                     break
                 n = int(yt.shape[0])
                 loss, acc = model._train_batch(X0, yt, n)
-                model._update_auto_lr(loss, n)
+                model._update_auto(loss, n)
                 loss_v = float(loss.detach().cpu().item())
                 acc_v = int(acc.detach().cpu().item())
                 total_loss += loss_v
@@ -302,16 +302,17 @@ def train(args):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--workdir", default="/workspace/soma_v12")
-    p.add_argument("--data", default="/workspace/soma_v12/data/enwik9")
+    p.add_argument("--workdir", default="/workspace/soma_v12_1")
+    p.add_argument("--data", default="/workspace/soma_v12_1/data/enwik9")
     p.add_argument("--checkpoint", default="soma_cloud.pt")
     p.add_argument("--resume", action="store_true", default=True)
     p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--max-bytes", type=int, default=0)
-    p.add_argument("--bands", type=int, default=50)
+    p.add_argument("--bands", type=int, default=16)
     p.add_argument("--base", type=float, default=1.6180)
-    p.add_argument("--hidden", type=int, default=1024)
-    p.add_argument("--layers", type=int, default=3)
+    p.add_argument("--hidden", type=int, default=1536)
+    p.add_argument("--layers", type=int, default=2,
+                   help="belief stacks")
     p.add_argument("--batch", type=int, default=512)
     p.add_argument("--lr", default="auto")
     p.add_argument("--max-change", default="auto")

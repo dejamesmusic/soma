@@ -26,6 +26,7 @@ import time
 import json
 import signal
 import select
+import ssl
 from urllib.request import Request, urlopen
 from urllib.parse import urlencode
 from urllib.error import URLError, HTTPError
@@ -35,13 +36,19 @@ MAX_RESPONSE_CHARS = 16_000
 POST_RETRIES = 3
 POST_RETRY_SLEEP = 1.5
 
+try:
+    import certifi
+    URL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
+except Exception:
+    URL_CONTEXT = ssl.create_default_context()
+
 
 def _post_json(url, data, timeout=10):
     """POST JSON, return parsed response and HTTP status."""
     body = json.dumps(data).encode("utf-8")
     req = Request(url, data=body, method="POST")
     req.add_header("Content-Type", "application/json")
-    with urlopen(req, timeout=timeout) as resp:
+    with urlopen(req, timeout=timeout, context=URL_CONTEXT) as resp:
         raw = resp.read().decode("utf-8")
         parsed = json.loads(raw) if raw else {}
         return parsed, resp.status
@@ -52,7 +59,7 @@ def _get_json(url, params=None, timeout=5):
     if params:
         url = f"{url}?{urlencode(params)}"
     req = Request(url)
-    with urlopen(req, timeout=timeout) as resp:
+    with urlopen(req, timeout=timeout, context=URL_CONTEXT) as resp:
         raw = resp.read().decode("utf-8")
         parsed = json.loads(raw) if raw else {}
         return parsed, resp.status

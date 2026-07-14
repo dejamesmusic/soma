@@ -8,7 +8,8 @@
 #   - installs numpy + torch (~300MB download, one-time)
 #
 # On every run, after bootstrap:
-#   ./soma                  interactive CLI (train/eval/chat)
+#   ./soma train <corpus>   train v12.2 serial soma
+#   ./soma chat <ckpt>      chat with a v12.2 checkpoint
 #   ./soma stream <args>    run wikistream (rolling wiki corpus)
 #   ./soma loop <args>      run soma_loop (perpetual training)
 #
@@ -60,6 +61,12 @@ VENV_DIR="venv"
 VENV_PY="$VENV_DIR/bin/python"
 
 if [ ! -x "$VENV_PY" ]; then
+    if [ -e "$VENV_DIR" ] || [ -L "$VENV_DIR" ]; then
+        err "local venv exists but is not usable: $VENV_DIR"
+        err "remove it with: rm -rf venv"
+        err "then run ./soma again."
+        exit 1
+    fi
     say "first run — creating local virtualenv from $PY_BIN"
     "$PY_BIN" -m venv "$VENV_DIR"
 fi
@@ -177,7 +184,8 @@ print(s['path'] if s else '')
 
   ░▒▓ soma ▓▒░  launcher
 
-  ./soma                       interactive CLI (train, eval, chat)
+  ./soma train <corpus>        train v12.2 serial soma
+  ./soma chat <checkpoint>     chat with a v12.2 checkpoint
   ./soma gui                   launch the gui
   ./soma stream [name] [path]  run a stream (lists available if ambiguous)
   ./soma streams               list available streams
@@ -191,16 +199,16 @@ EOF
         exit 0
         ;;
     "")
-        # no subcommand: launch interactive CLI
+        # no subcommand: show v12.2 cli help
         printf "${BOLD}\n"
         cat <<'BANNER'
   ░▒▓ soma ▓▒░
 BANNER
         printf "${RESET}\n"
-        exec "$VENV_PY" soma_v12.py
+        exec "$VENV_PY" soma_v12_2.py --help
         ;;
     *)
-        # unknown subcommand: forward all args to soma_v12.py
-        exec "$VENV_PY" soma_v12.py "$@"
+        # unknown subcommand: forward all args to soma_v12_2.py
+        exec "$VENV_PY" soma_v12_2.py "$@"
         ;;
 esac

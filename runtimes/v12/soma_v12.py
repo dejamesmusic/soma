@@ -312,6 +312,11 @@ class TraceBank:
                 L, dtype=self.trace_dtype,
                 device=self.trace_device).view(1, L)
             * self.log_decay.view(n_bands, 1))            # (K, L): d^t
+        self._dpow_step = torch.exp(
+            torch.arange(
+                L + 1, dtype=self.trace_dtype,
+                device=self.trace_device).view(1, L + 1)
+            * self.log_decay.view(n_bands, 1))            # (K, L+1): d^t
 
     def reset(self):
         self.traces.zero_()
@@ -363,12 +368,15 @@ class TraceBank:
         N = dense.shape[0]
         if N == 0:
             return
-        pos = torch.arange(N, dtype=self.trace_dtype, device=self.trace_device)
-        w = torch.exp(((N - 1) - pos).unsqueeze(1)
-                      * self.log_decay.unsqueeze(0))      # (N, K)
-        counts = dense.T @ w                              # (C, K)
-        self.traces = (self.traces * (self.decay ** N).unsqueeze(0)
-                       + self.alphas.unsqueeze(0) * counts)
+        for c0 in range(0, N, self.CHUNK):
+            c1 = min(c0 + self.CHUNK, N)
+            n = c1 - c0
+            xc = dense[c0:c1]
+            w = self._dpow[:, :n].T.flip(0)               # (n, K)
+            counts = xc.T @ w                             # (C, K)
+            self.traces = (
+                self.traces * self._dpow_step[:, n].unsqueeze(0)
+                + self.alphas.unsqueeze(0) * counts)
 
     def process_block(self, x):
         """features for every position (state BEFORE absorbing that
@@ -396,11 +404,8 @@ class TraceBank:
             bp[:-1] = states[:-1] - states[1:]
             bp[-1] = states[-1]
             feats[c0:c1] = bp.permute(1, 2, 0).reshape(n, -1).float()
-            pos = torch.arange(
-                n, dtype=self.trace_dtype, device=self.trace_device)
-            w = torch.exp(((n - 1) - pos).unsqueeze(1)
-                          * self.log_decay.unsqueeze(0))
-            S = (S * (self.decay ** n).unsqueeze(0)
+            w = self._dpow[:, :n].T.flip(0)
+            S = (S * self._dpow_step[:, n].unsqueeze(0)
                  + self.alphas.unsqueeze(0) * (xc.T @ w))
 
         self.traces = S
@@ -449,11 +454,8 @@ class TraceBank:
                     bp.permute(1, 2, 0).reshape(take, -1).float())
                 out0 += take
 
-            pos = torch.arange(
-                n, dtype=self.trace_dtype, device=self.trace_device)
-            w = torch.exp(((n - 1) - pos).unsqueeze(1)
-                          * self.log_decay.unsqueeze(0))
-            S = (S * (self.decay ** n).unsqueeze(0)
+            w = self._dpow[:, :n].T.flip(0)
+            S = (S * self._dpow_step[:, n].unsqueeze(0)
                  + self.alphas.unsqueeze(0) * (xc.T @ w))
 
         self.traces = S
