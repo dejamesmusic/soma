@@ -82,6 +82,8 @@ mkdir -p "$SCRIPT_BUNDLE/cloud" "$SCRIPT_BUNDLE/streams" "$SCRIPT_BUNDLE/experim
 /usr/bin/ditto "$ROOT/soma_logos_bridge.py" "$SCRIPT_BUNDLE/soma_logos_bridge.py"
 /usr/bin/ditto "$ROOT/streams_registry.py" "$SCRIPT_BUNDLE/streams_registry.py"
 /usr/bin/ditto "$ROOT/build_fineweb_edu_txt.py" "$SCRIPT_BUNDLE/build_fineweb_edu_txt.py"
+/usr/bin/ditto "$ROOT/prepare_soma_qa.py" "$SCRIPT_BUNDLE/prepare_soma_qa.py"
+/usr/bin/ditto "$ROOT/export_imessages.py" "$SCRIPT_BUNDLE/export_imessages.py"
 /usr/bin/ditto "$ROOT/concat_txt_corpus.py" "$SCRIPT_BUNDLE/concat_txt_corpus.py"
 /usr/bin/ditto "$ROOT/cloud/train_cloud.py" "$SCRIPT_BUNDLE/cloud/train_cloud.py"
 /usr/bin/ditto "$ROOT/cloud/README_cloud.md" "$SCRIPT_BUNDLE/cloud/README_cloud.md"

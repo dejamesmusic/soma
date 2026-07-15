@@ -800,6 +800,7 @@ class ChatWorker:
         self.outbox = queue.Queue(maxsize=10000)
         self._thread = None
         self._running = False
+        self._stop_generation = threading.Event()
         self.dirty = False
 
     def load(self, ckpt_path, online=False,
@@ -820,7 +821,12 @@ class ChatWorker:
         return self.model
 
     def submit(self, text):
+        self._stop_generation.clear()
         self.tasks.put(text)
+
+    def stop_generation(self):
+        """Request a cooperative stop after the current sampled byte."""
+        self._stop_generation.set()
 
     def _run(self):
         while self._running:
@@ -840,13 +846,18 @@ class ChatWorker:
                         length=self.max_length,
                         temperature=self.temperature,
                         prelude_source="chat"):
+                    if self._stop_generation.is_set():
+                        self.outbox.put(('status', 'generation stopped'))
+                        break
                     self.outbox.put(('char', ch))
                 # Prompt ingestion and generation both advance the trace bank;
                 # online mode may also update weights. Treat a completed turn
                 # as dirty so unload can offer save/discard/cancel.
                 self.dirty = True
+                self._stop_generation.clear()
                 self.outbox.put(('done',))
             except Exception as e:
+                self._stop_generation.clear()
                 self.outbox.put(('error', f"{type(e).__name__}: {e}"))
 
     def drain(self, max_items=500):
@@ -1967,8 +1978,11 @@ class App:
             self.chat_input.config(height=lines)
 
     def _chat_send(self):
+        if self._chat_pending:
+            self._chat_stop()
+            return
         text = self.chat_input.get("1.0", "end-1c").strip()
-        if not text or self.chat.model is None or self._chat_pending:
+        if not text or self.chat.model is None:
             return
         self.chat_input.delete("1.0", "end")
         self._resize_chat_input()
@@ -1993,8 +2007,19 @@ class App:
         soma_label = speaker.ljust(w)
         self._chat_append(f"{you_label} › {text}\n", "you")
         self._chat_append(f"{soma_label} › ", "soma")
-        self._chat_pending = True
+        self._set_chat_pending(True)
         self.chat.submit(text)
+
+    def _chat_stop(self):
+        self.chat.stop_generation()
+        self.chat_status.config(text="stopping generation...")
+        self.chat_send_btn.set_text("stopping…")
+        self.chat_send_btn.set_enabled(False)
+
+    def _set_chat_pending(self, pending):
+        self._chat_pending = bool(pending)
+        self.chat_send_btn.set_text("stop" if pending else "send")
+        self.chat_send_btn.set_enabled(True)
 
     def _chat_append(self, text, tag, persist=True):
         self.chat_text.config(state="normal")
@@ -3441,7 +3466,7 @@ class App:
                 self._append_text_file(
                     CHAT_LOG_FILE, response + "\n\n",
                     max_bytes=MAX_CHAT_LOG_BYTES)
-                self._chat_pending = False
+                self._set_chat_pending(False)
                 mode = "online" if self.chat.online else "context"
                 self.chat_status.config(text=f"loaded · {mode}")
                 # if this was a logOS prompt, send the full response back.
@@ -3464,7 +3489,7 @@ class App:
                     self.logos_response_buf.clear()
             elif kind == 'error':
                 self._chat_append(f"\n  error: {rest[0]}\n\n", "dim")
-                self._chat_pending = False
+                self._set_chat_pending(False)
                 self.chat_response_buf.clear()
                 self.logos_response_buf.clear()
 
@@ -3491,7 +3516,7 @@ class App:
                         f"{you_label} › {prompt}\n", "you")
                     self._chat_append(f"{soma_label} › ", "soma")
                     self.logos_response_buf.clear()
-                    self._chat_pending = True
+                    self._set_chat_pending(True)
                     self.chat.online = self.chat_online_cb.get()
                     try:
                         self.chat.max_length = int(
