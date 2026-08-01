@@ -1,0 +1,20 @@
+{
+ "runtime_id": "soma.v12.3",
+ "version": "12.3.17",
+ "released": "2026-08-01",
+ "files": [
+  {
+   "name": "soma.dmg",
+   "sha256": "582bfcd81a7fd9d17234953d904ba2f5e6a7ea1d452a1f6e903d81937b4c2836"
+  },
+  {
+   "name": "soma_v12_3.zip",
+   "sha256": "23e6ef5c53ef717583a6a48abe589217ab328c9c1db0869bb4a11576f3e3b481"
+  },
+  {
+   "name": "soma_v12_3.py",
+   "sha256": "f1b738e19e4be745ffc4f95c661c002ab0e4ee32e5d4b16d8eedc120d6824767"
+  }
+ ],
+ "source": "https://logossoma.com/api/runtimes/soma.v12.3/releases/12.3.17"
+}
