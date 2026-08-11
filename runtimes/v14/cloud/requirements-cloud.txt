@@ -1,0 +1,4 @@
+datasets>=4.0,<5
+pyarrow>=18,<22
+huggingface_hub>=0.30,<2
+ftfy>=6.2,<7

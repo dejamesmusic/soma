@@ -1,0 +1,112 @@
+{
+  "name": "soma v13 developmental curriculum v1",
+  "minimum_free_gb": 20,
+  "checkpoint": "soma_v13_k48.pt",
+  "model": {
+    "bands": 48,
+    "batch": 1024,
+    "lr": "auto 0.0003",
+    "decimation": 1.0,
+    "update_interval": 1,
+    "grad_clip": 1.0,
+    "dream_every": 64,
+    "dream_tokens": "128"
+  },
+  "builds": {
+    "tinystories_calibration": {
+      "kind": "dataset",
+      "source": "tinystories",
+      "target_gb": 0.0625,
+      "chunk_mb": 64
+    },
+    "tinystories": {
+      "kind": "dataset",
+      "source": "tinystories",
+      "target_gb": 2.0,
+      "chunk_mb": 64
+    },
+    "gutenberg": {
+      "kind": "dataset",
+      "source": "gutenberg",
+      "target_gb": 2.5,
+      "chunk_mb": 128
+    },
+    "conversation": {
+      "kind": "conversation"
+    },
+    "fineweb_edu": {
+      "kind": "dataset",
+      "source": "fineweb_edu",
+      "target_gb": 3.0,
+      "chunk_mb": 128
+    },
+    "wikipedia": {
+      "kind": "dataset",
+      "source": "wikipedia",
+      "target_gb": 1.0,
+      "chunk_mb": 128
+    }
+  },
+  "stages": [
+    {
+      "name": "00_calibration",
+      "build": "tinystories_calibration",
+      "files": ["cloud/tinystories/tinystories_0000.txt"],
+      "epochs": 1
+    },
+    {
+      "name": "01_language_foundations",
+      "build": "tinystories",
+      "files": ["cloud/tinystories/tinystories_*.txt"],
+      "epochs": 1
+    },
+    {
+      "name": "02_long_form_continuity",
+      "build": "gutenberg",
+      "files": ["cloud/gutenberg/gutenberg_*.txt"],
+      "epochs": 1
+    },
+    {
+      "name": "03_turn_foundations",
+      "build": "conversation",
+      "files": ["conversation_foundations_v4.txt"],
+      "epochs": 4
+    },
+    {
+      "name": "04_human_assistant",
+      "build": "conversation",
+      "files": ["conversation_human_assistant_v4.txt"],
+      "epochs": 3
+    },
+    {
+      "name": "05_conversation_worlds",
+      "build": "conversation",
+      "files": ["conversation_worlds_v4.txt"],
+      "epochs": 1
+    },
+    {
+      "name": "06_educational_breadth",
+      "build": "fineweb_edu",
+      "files": ["cloud/fineweb_edu/fineweb_edu_*.txt"],
+      "epochs": 1
+    },
+    {
+      "name": "07_factual_grounding",
+      "build": "wikipedia",
+      "files": ["cloud/wikipedia/wikipedia_*.txt"],
+      "epochs": 1
+    },
+    {
+      "name": "08_conversational_consolidation",
+      "build": "conversation",
+      "files": ["conversation_worlds_v4.txt"],
+      "epochs": 1
+    },
+    {
+      "name": "09_long_form_consolidation",
+      "build": "gutenberg",
+      "files": ["cloud/gutenberg/gutenberg_*.txt"],
+      "epochs": 1
+    }
+  ]
+}

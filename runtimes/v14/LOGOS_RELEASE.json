@@ -1,0 +1,20 @@
+{
+ "runtime_id": "soma.v14",
+ "version": "14.0.0-dev.2",
+ "released": "2026-08-11",
+ "files": [
+  {
+   "name": "soma.dmg",
+   "sha256": "29d660d1577a739a4ae4bbcfb982565a3d791c16316afac9a8495f52ef17e5e1"
+  },
+  {
+   "name": "soma_v14.zip",
+   "sha256": "fb33c4980a53c6560f2eb0ae9453d53d40f5661d14d2f9b8b7cb67f1ac84f276"
+  },
+  {
+   "name": "soma_v14.py",
+   "sha256": "a7ffba701ce348bd5e15cbfa707acf210b3fff3573d1a6a3725337b54102fac5"
+  }
+ ],
+ "source": "https://logossoma.com/api/runtimes/soma.v14/releases/14.0.0-dev.2"
+}
