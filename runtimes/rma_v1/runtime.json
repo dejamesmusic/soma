@@ -1,7 +1,7 @@
 {
   "protocolVersion": 1,
   "id": "soma.rma_v1",
-  "version": "1.6.3",
+  "version": "1.6.4",
   "name": "rma v1",
   "description": "residual metabolic aperture · 8k alphabet · directional temporal bands",
   "python": "/Library/Frameworks/Python.framework/Versions/3.11/bin/python3",
@@ -14,7 +14,7 @@
   "checkpoint": {
     "format": "soma-rma-v1-pytorch",
     "compatibility": "exact-runtime",
-    "opens": ["1.6.0", "1.6.1", "1.6.2"],
+    "opens": ["1.6.0", "1.6.1", "1.6.2", "1.6.3"],
     "cursorPolicy": "resume-saved",
     "lineage": true
   },
@@ -32,9 +32,9 @@
     {"key":"save_path","label":"checkpoint path","type":"text","value":"","group":"output"},
     {"key":"checkpoint","label":"continue from","type":"file","value":"","group":"output"},
     {"key":"fork","label":"fork checkpoint","type":"boolean","value":"false","options":["false","true"],"group":"output"},
-    {"key":"width","label":"temporal width","type":"integer","value":"256","options":["8","128","256","384","512","768","1024"],"group":"shape"},
+    {"key":"width","label":"temporal width","type":"integer","value":"256","options":["8","128","256","384","512","768","1024","1536","2048","3072","4096"],"group":"shape"},
     {"key":"bands","label":"temporal bands","type":"integer","value":"32","options":["4","16","24","32","48","64"],"group":"shape"},
-    {"key":"cortex_width","label":"cortex width","type":"integer","value":"0","options":["0","256","512","1024"],"group":"shape"},
+    {"key":"cortex_width","label":"cortex width","type":"integer","value":"0","options":["0","256","512","1024","2048"],"group":"shape"},
     {"key":"cortex_depth","label":"cortex depth","type":"integer","value":"0","options":["0","1","2","3"],"group":"shape"},
     {"key":"workspace_tokens","label":"exact workspace","type":"integer","value":"0","options":["0","2","4","8"],"group":"shape"},
     {"key":"readout_window","label":"readout window","type":"integer","value":"256","group":"hidden"},

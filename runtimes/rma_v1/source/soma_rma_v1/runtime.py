@@ -41,7 +41,7 @@ BODY_SPAN = 2048
 
 
 RUNTIME_ID = "soma.rma_v1"
-RUNTIME_VERSION = "1.6.3"
+RUNTIME_VERSION = "1.6.4"
 CHECKPOINT_FORMAT = "soma-rma-v1-pytorch"
 CHECKPOINT_VERSION = 1
 TEXT_PROTOCOL_ID = "soma-text-turn-v1"
