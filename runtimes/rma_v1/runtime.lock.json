@@ -1,0 +1,87 @@
+{
+  "lockVersion": 1,
+  "runtime": "soma.rma_v1@1.6.3",
+  "digest": "e79908ebf9bf0cd802895d678cb35aa6161cae379d6fc7aed51d8858c506b677",
+  "files": [
+    {
+      "path": "runtime.json",
+      "sha256": "376a6d2af31774e20d84ce661f2bbf8938236876314ea376650f926f62e05907",
+      "bytes": 3761
+    },
+    {
+      "path": "source/requirements.txt",
+      "sha256": "8cb9aabab09f1b1a14bb2c2acdf58e72ff8cb3aa890ea1496be906a70fbf3bf0",
+      "bytes": 51
+    },
+    {
+      "path": "source/soma_rma_v1/__init__.py",
+      "sha256": "48a64ff6b3c02ac736b5facfb379906b96a5d54f241f8e714250eff8abe01fa3",
+      "bytes": 336
+    },
+    {
+      "path": "source/soma_rma_v1/body.py",
+      "sha256": "9d8941b0055bbc0bf4d566d78cbe44da515f79da0d89231d5fdd63c379fdf034",
+      "bytes": 21961
+    },
+    {
+      "path": "source/soma_rma_v1/body_tokenizer.py",
+      "sha256": "2492827998af5134962fbfd4de52c62b76a0337218b942f953316bca675c30c1",
+      "bytes": 9947
+    },
+    {
+      "path": "source/soma_rma_v1/config.py",
+      "sha256": "eb289a389f8547bd6947ecac1cfd3553b57925ea605742df31dc9876a52fa564",
+      "bytes": 8187
+    },
+    {
+      "path": "source/soma_rma_v1/engine.py",
+      "sha256": "caf83d307fcc49caba89789ccffd9d556ed6c61db03072f476230657f2e93165",
+      "bytes": 111781
+    },
+    {
+      "path": "source/soma_rma_v1/foundation.py",
+      "sha256": "ac39ec17e9dfa192fc518cf370abce574f6646ed92283ed68016f72515088f4b",
+      "bytes": 13897
+    },
+    {
+      "path": "source/soma_rma_v1/metal_kernels.py",
+      "sha256": "0327b2f02289700b96f06ee5fca8d295513643dfff9340c4be38ff1e9f4f4da9",
+      "bytes": 18393
+    },
+    {
+      "path": "source/soma_rma_v1/protocol.py",
+      "sha256": "103cfd88e384a756ca71578f963cf10265d1474c55d204907e6f17548e429a3a",
+      "bytes": 18383
+    },
+    {
+      "path": "source/soma_rma_v1/runtime.py",
+      "sha256": "bc63c4d380b3da6e6792c1a79f72d2814120bbb486154a4ac17a464dd4cf7916",
+      "bytes": 79840
+    },
+    {
+      "path": "source/soma_rma_v1/soma_train_worker.py",
+      "sha256": "748f68ee777ad802cff200acdba72eafa75ee410b2993f7b8c406fd6cf5ce821",
+      "bytes": 19609
+    },
+    {
+      "path": "source/soma_rma_v1/tokenizer/soma-8k-v1.json",
+      "sha256": "a9ebb31d33cf57502747d3ee216189b7bd3b27e2182e59b4b379f7dd04b7578f",
+      "bytes": 1620
+    },
+    {
+      "path": "source/soma_rma_v1/tokenizer/soma-8k-v1.model",
+      "sha256": "9b435e2e58db184b35aae71af334f6ea097e2dc567f21e32ba5495c77d1cfcec",
+      "bytes": 127472
+    },
+    {
+      "path": "source/soma_rma_v1/tokenizer/soma-8k-v1.vocab",
+      "sha256": "1b206b8d08adfaa8d05dedf625a615ec24e4eaa140dbd5a3ca49bb8c0426790c",
+      "bytes": 108105
+    },
+    {
+      "path": "source/soma_rma_v1/tokenizer.py",
+      "sha256": "ec0e02cac5e8960e3e9288339f9a79061ffa0bc01b045bc68b988b1552046a3c",
+      "bytes": 3398
+    }
+  ]
+}

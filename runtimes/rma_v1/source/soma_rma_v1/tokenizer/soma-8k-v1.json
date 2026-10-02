@@ -1,0 +1,72 @@
+{
+  "name": "soma-8k-v1",
+  "vocab_size": 8192,
+  "model_sha256": "9b435e2e58db184b35aae71af334f6ea097e2dc567f21e32ba5495c77d1cfcec",
+  "model_type": "bpe",
+  "byte_fallback": true,
+  "normalization": "identity",
+  "split_by_whitespace": true,
+  "control_symbols": [
+    "<|soma_state|>",
+    "<|turn|>",
+    "<|user|>",
+    "<|soma|>",
+    "<|dream|>"
+  ],
+  "sources": [
+    {
+      "name": "meaning_curriculum_01.txt",
+      "source_bytes": 31162547,
+      "sampled_bytes": 31162544
+    },
+    {
+      "name": "meaning_curriculum_02_dialogue_worlds.txt",
+      "source_bytes": 205530128,
+      "sampled_bytes": 33554432
+    },
+    {
+      "name": "simplestories.txt",
+      "source_bytes": 2647506846,
+      "sampled_bytes": 33554432
+    },
+    {
+      "name": "tinystories_train.txt",
+      "source_bytes": 1924281556,
+      "sampled_bytes": 33554432
+    },
+    {
+      "name": "fineweb_edu_0000.txt",
+      "source_bytes": 536863261,
+      "sampled_bytes": 33554432
+    },
+    {
+      "name": "enwik9",
+      "source_bytes": 1000000000,
+      "sampled_bytes": 33554432
+    },
+    {
+      "name": "childrens_books.txt",
+      "source_bytes": 20635335,
+      "sampled_bytes": 20635332
+    },
+    {
+      "name": "BNCCorpus.txt",
+      "source_bytes": 19081694,
+      "sampled_bytes": 19081692
+    }
+  ],
+  "roundtrip_probes": [
+    {
+      "text": "the quick brown fox jumps over the lazy dog.\n",
+      "tokens": 12
+    },
+    {
+      "text": "<|user|>hello<|turn|><|soma|>hello back<|turn|>",
+      "tokens": 9
+    },
+    {
+      "text": "bytes: \u0000 \u001e café — 日本語\n",
+      "tokens": 23
+    }
+  ]
+}
