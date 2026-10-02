@@ -41,7 +41,7 @@ BODY_SPAN = 2048
 
 
 RUNTIME_ID = "soma.rma_v1"
-RUNTIME_VERSION = "1.6.4"
+RUNTIME_VERSION = "1.7.0"
 CHECKPOINT_FORMAT = "soma-rma-v1-pytorch"
 CHECKPOINT_VERSION = 1
 TEXT_PROTOCOL_ID = "soma-text-turn-v1"
@@ -364,7 +364,7 @@ class SOMA:
         args = engine.args
         args.cortex_rate = config.cortex_rate
         engine.learner.cortex_gain = config.cortex_rate
-        args.lr = config.source_gain
+        args.lr = config.source_gain * config.width_rate
         args.io2_mode = "full"
         args.batch_mode = "fixed"
         args.batch_controller = "io2"
@@ -719,7 +719,7 @@ class SOMA:
             # the update boundary, so scaling the learning rate by the quantum
             # a second time turns larger horizons into larger rotations.
             engine.learner.base_lr = (
-                self.config.source_gain * engine.io2_ratio
+                self.config.source_gain * self.config.width_rate * engine.io2_ratio
             )
         with torch.enable_grad():
             features = engine.bank.process_block_select(
@@ -1239,7 +1239,7 @@ class SOMA:
         """
         engine = self.engine
         fraction = engine.optimizer_source_tokens / self._chat_update_span()
-        return self.config.source_gain * engine.io2_ratio * min(1.0, fraction)
+        return self.config.source_gain * self.config.width_rate * engine.io2_ratio * min(1.0, fraction)
 
     def learn_ids(self, ids, source_bytes, weights=None):
         """chat's learning: training with no decimation and variable batches.
@@ -1625,6 +1625,8 @@ class SOMA:
         # v1.1 and earlier exposed cross-band differences.  Their weights
         # remain valid because the identity trace tensor itself is unchanged.
         saved_config.setdefault("input_representation", "cross_band")
+        # saved before width scaling existed: keep the dynamics it learned under
+        saved_config.setdefault("width_scaling", 0.0)
         # a body's stride briefly had its own setting; io2 owns it again
         saved_config.pop("body_stride", None)
         if "evidence_quantum" not in saved_config:

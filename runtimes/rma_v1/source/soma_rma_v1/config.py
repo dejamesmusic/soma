@@ -15,6 +15,10 @@ CORTEX_RATE_OPTIONS = (0.25, 0.5, 1.0)
 CORTEX_RATE_CAP = max(CORTEX_RATE_OPTIONS)
 
 
+# the width rma's dynamics were validated at; wider models scale their updates from it
+REFERENCE_WIDTH = 256.0
+
+
 @dataclass(frozen=True)
 class RMAConfig:
     # capacity and temporal extent
@@ -57,6 +61,17 @@ class RMAConfig:
     metabolic_relaxation_tokens: int = 11_520
     surprise_response_tokens: int = 58
 
+    # how the learning rate scales past the validated 256-wide reference: an update moves
+    # min(1, 256 / width) ** width_scaling of a 256-wide update. unscaled (0), one update's
+    # effect on the logits grows about as width ** 0.6 and models diverge past width ~3000;
+    # 0.5 holds it near the 256-wide value (experiments/width_scaling.py). checkpoints saved
+    # before this field restore 0, the dynamics they learned under.
+    width_scaling: float = 0.5
+
+    @property
+    def width_rate(self):
+        return min(1.0, REFERENCE_WIDTH / self.width) ** self.width_scaling
+
     def validate(self):
         if self.width < 1 or self.bands < 4:
             raise ValueError("width must be positive and bands must be at least four")
@@ -98,6 +113,8 @@ class RMAConfig:
             raise ValueError("metabolic_relaxation_tokens must be positive")
         if self.surprise_response_tokens < 1:
             raise ValueError("surprise_response_tokens must be positive")
+        if not math.isfinite(self.width_scaling) or self.width_scaling < 0.0:
+            raise ValueError("width_scaling must be finite and non-negative")
         return self
 
     @property

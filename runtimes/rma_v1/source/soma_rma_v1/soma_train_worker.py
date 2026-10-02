@@ -196,6 +196,7 @@ class Worker:
     def build_model(self):
         def requested_config(
             width, bands, input_representation="adjacent_difference", body="",
+            width_scaling=None,
         ):
             return RMAConfig(
                 width=int(width), bands=int(bands),
@@ -222,6 +223,11 @@ class Worker:
                 surprise_response_tokens=int(
                     self.config.get("surprise_response_tokens", 58)
                 ),
+                # a continuation keeps its model's own scaling unless the run sets one
+                width_scaling=float(self.config.get(
+                    "width_scaling",
+                    RMAConfig.width_scaling if width_scaling is None else width_scaling,
+                )),
             ).validate()
 
         checkpoint = str(self.config.get("checkpoint", "")).strip()
@@ -234,6 +240,7 @@ class Worker:
                 self.config.get("bands", model.config.bands),
                 model.config.input_representation,
                 model.config.body,
+                model.config.width_scaling,
             ))
             if self.config.get("fork", False):
                 self.event("saving", self.config["save_path"])

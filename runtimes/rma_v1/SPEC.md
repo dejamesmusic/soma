@@ -132,6 +132,13 @@ weights learned. input representation cannot change during continuation.
 - `evidence_quantum`: fixed batch of admitted predictions per optimizer update;
 - `decimation_stride_cap`: maximum source-token distance between admitted errors;
 - `traversal_gain`: dilation of the residual-derived coordinate on the phi axis.
+- `width_scaling`: how updates scale past the validated 256-wide reference. an update moves
+  min(1, 256 / width) ** width_scaling of a 256-wide update (default 0.5 for new models;
+  checkpoints saved before 1.7 restore 0, the dynamics they learned under). unscaled, one
+  update's effect on the logits grew about as width ** 0.6 (0.016 at width 128, 0.047 at 1024,
+  with spikes to 0.21), and models diverged past width ~3000 with or without io2; at 0.5 the
+  effect stays near the 256-wide value (0.020 at 512, 0.026 at 1024) and the spikes go
+  (`experiments/width_scaling.py`, `experiments/WIDTH_SCALING_RESULTS_2026-10-02.md`).
 
 the slow clock, evidence-normalized update law, activation budget, matrix radii,
 whitening response, and controller source-time conversion are derived invariants rather
