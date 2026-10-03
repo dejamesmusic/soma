@@ -41,13 +41,9 @@ class CorticalContext:
     """
 
     def __init__(self, workspace=None, recent=None, recent_unique=None,
-                 recent_inverse=None, body=None, controls=None):
+                 recent_inverse=None):
         self.workspace = workspace
         self.recent = recent
-        # the body's opinion of each row's target: (log p given text, entropy,
-        # top log p, whether the target is a control), and soma's control ids
-        self.body = body
-        self.controls = controls
         # distinct ids in `recent` and, for every entry, its index among them:
         # the pointer projects keys only for tokens actually in the window
         self.recent_unique = recent_unique
@@ -128,17 +124,6 @@ class SentinelPointer(nn.Module):
         return weights[:, :self.window], weights[:, self.window]
 
     @staticmethod
-    @torch.no_grad()
-    def control_mass(logits, normaliser, weights, keep, recent_ids, controls):
-        """probability soma's readout puts on its control tokens."""
-        mass = torch.exp(logits[:, controls] - normaliser[:, None]).sum(1)
-        if weights is None:
-            return mass
-        current = recent_ids[:, :weights.shape[1]]
-        copied = (weights * (current[..., None] == controls).any(-1)).sum(1)
-        return keep * mass + copied
-
-    @staticmethod
     def with_pointer(model_log, weights, keep, recent_ids, targets):
         """log p(target) of the mixture from the model's log p(target)."""
         current = recent_ids[:, :weights.shape[1]]
@@ -216,47 +201,6 @@ class SentinelPointer(nn.Module):
         )
 
 
-class BodyGate(nn.Module):
-    """how much of the next token soma hands to its body.
-
-    A sigmoid of soma's normalised language and the body's own confidence
-    (its entropy and top log-probability) at that position, plus a fixed
-    prior: p = (1 - g) * p_soma + g * p_body.  The body is fluent from the
-    start and a new soma is not, so, like the pointer's sentinel offset, the
-    prior holds the newcomer nearly shut (g about 0.98) until it earns trust.
-    """
-
-    PRIOR = 4.0
-
-    def __init__(self, width):
-        super().__init__()
-        self.weight = nn.Parameter(
-            nn.init.xavier_uniform_(torch.empty(1, int(width) + 2))
-        )
-
-    def forward(self, language, entropy, top):
-        features = torch.cat((
-            F.rms_norm(language, (language.shape[1],)),
-            entropy[:, None].to(language.dtype), top[:, None].to(language.dtype),
-        ), 1)
-        return torch.sigmoid(features @ self.weight.T + self.PRIOR)[:, 0].clamp(1e-6, 1.0 - 1e-6)
-
-
-def split_mixture(soma_log, body_log, share, controls):
-    """the full log-distribution beside a body: controls priced by soma alone,
-    text shared, p(x) = (1 - g) p_soma(x) + g (1 - P_soma(controls)) p_body(x | text).
-    Rows of normalised log-probabilities in, rows out."""
-    control_mass = soma_log[:, controls].exp().sum(1).clamp_max(1.0 - 1e-6)
-    body_text = body_log.index_fill(1, controls, float("-inf"))
-    body_text = body_text - torch.logsumexp(body_text, 1, keepdim=True)
-    mixed = torch.logaddexp(
-        torch.log1p(-share)[:, None] + soma_log,
-        (torch.log(share) + torch.log1p(-control_mass))[:, None] + body_text,
-    )
-    mixed[:, controls] = soma_log[:, controls]
-    return mixed
-
-
 class ReadoutTargets(torch.autograd.Function):
     """the cortex's two readout predictions at the target, with analytic
     gradients.
@@ -320,8 +264,7 @@ class GraftApertureNet(nn.Module):
                  detach_stages=False, mixer=True, language_depth=0,
                  language_expansion=2, language_residual_scale=0.1,
                  aperture_width=None, cortex_width=0, cortex_depth=0,
-                 workspace_tokens=0, cortex_expansion=4, readout_window=0,
-                 body_gate=False):
+                 workspace_tokens=0, cortex_expansion=4, readout_window=0):
         super().__init__()
         self.vocab = int(vocab)
         self.token_dim = int(token_dim)
@@ -374,7 +317,6 @@ class GraftApertureNet(nn.Module):
             SentinelPointer(readout_window, self.token_dim)
             if self.cortex is not None and int(readout_window) > 0 else None
         )
-        self.body_gate = BodyGate(self.token_dim) if body_gate else None
 
     @property
     def output_weight(self):
@@ -556,13 +498,8 @@ class GraftApertureNet(nn.Module):
             ]
         if self.cortex is not None:
             groups["cortex"] = self.cortex.parameter_groups()
-            if self.recent_readout is not None or self.body_gate is not None:
-                groups["cortex"]["readout"] = list(
-                    self.recent_readout.parameters()
-                    if self.recent_readout is not None else []
-                ) + (
-                    [self.body_gate.weight] if self.body_gate is not None else []
-                )
+            if self.recent_readout is not None:
+                groups["cortex"]["readout"] = list(self.recent_readout.parameters())
         return groups
 
 
@@ -1254,7 +1191,6 @@ class Experiment:
             workspace_tokens=getattr(args, "workspace_tokens", 0),
             cortex_expansion=getattr(args, "cortex_expansion", 4),
             readout_window=getattr(args, "readout_window", 0),
-            body_gate=bool(getattr(args, "body_gate", False)),
         ).to(self.device)
         schedule = args.schedule
         if condition == "global_uniform" or condition == "local_uniform":
@@ -1353,8 +1289,6 @@ class Experiment:
         # the loss is taken at the target only
         self._last_rank = None
         self._last_row = None
-        # mean share handed to the body in the last scored block
-        self.last_body_share = None
         # v14 io2 clock: gradients and controller evidence accumulate across
         # decimated source blocks until one fixed prediction quantum is full.
         self.optimizer_prediction_mass = 0.0
@@ -2029,47 +1963,6 @@ class Experiment:
                     self._last_row = SentinelPointer.mix(
                         combined[-1:], pointer[-1:], keep[-1:], context.recent[-1:]
                     )[0]
-            if context.body is not None and self.model.body_gate is not None:
-                # The body is an expert beside soma's own readout.  Controls
-                # are soma's protocol, so soma alone prices them; the body
-                # shares only the text:  p(c) = p_soma(c), and
-                # p(x) = (1 - g) p_soma(x) + g (1 - P_soma(controls)) p_body(x | text).
-                # The control mass enters as a detached factor.
-                expert_log, entropy, top, is_control, *full = context.body
-                share = self.model.body_gate(
-                    self.model.summed_language(languages).detach(), entropy, top
-                )
-                self.last_body_share = share.detach().mean()
-                text_share = torch.log(share)
-                if context.controls is not None and len(context.controls):
-                    text_share = text_share + torch.log1p(-SentinelPointer.control_mass(
-                        combined, normaliser,
-                        None if pointer is None else pointer.detach(),
-                        None if keep is None else keep.detach(),
-                        context.recent, context.controls,
-                    ).clamp_max(1.0 - 1e-6))
-                body_text = text_share + expert_log
-                combined_log = torch.where(is_control, combined_log, torch.logaddexp(
-                    torch.log1p(-share) + combined_log, body_text
-                ))
-                candidate_log = torch.where(is_control, candidate_log, torch.logaddexp(
-                    torch.log1p(-share) + candidate_log, body_text
-                ))
-                if full and full[0] is not None and context.controls is not None:
-                    # accuracy is the whole model's: rank the target in the
-                    # full mixture, as the loss already is
-                    with torch.no_grad():
-                        soma_full = (
-                            SentinelPointer.mix(combined, pointer, keep, context.recent)
-                            if pointer is not None
-                            else torch.log_softmax(combined, 1)
-                        )
-                        mixed = split_mixture(
-                            soma_full, full[0], share.detach(), context.controls
-                        )
-                        own = mixed.gather(1, targets[:, None])
-                        self._last_rank = (mixed > own).sum(1)
-                        self._last_row = mixed[-1]
             token_nll = -combined_log
             candidate_nll = -candidate_log
             predictive_loss = (token_nll * weights).sum() / weights.sum()

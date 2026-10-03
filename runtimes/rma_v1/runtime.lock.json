@@ -1,12 +1,12 @@
 {
   "lockVersion": 1,
-  "runtime": "soma.rma_v1@1.7.0",
-  "digest": "753b4da97277fcacf16fbce5abb8b68735f1d116e246e2fc5bac7b277746c3a6",
+  "runtime": "soma.rma_v1@1.8.0",
+  "digest": "ef7ef6943995cd0647b4214dc4f0f6c3d3e284942b115e1b29b8bbe48291adc7",
   "files": [
     {
       "path": "runtime.json",
-      "sha256": "c281c0865c97719edfdf344fcf2f0a8726b03536aa042ff84e6125083640a0bb",
-      "bytes": 3814
+      "sha256": "0fd45267e7ebccc88b041a7760ed17c53b7080f98865dbc5c620cfc1ec6bf702",
+      "bytes": 3327
     },
     {
       "path": "source/requirements.txt",
@@ -19,24 +19,14 @@
       "bytes": 336
     },
     {
-      "path": "source/soma_rma_v1/body.py",
-      "sha256": "9d8941b0055bbc0bf4d566d78cbe44da515f79da0d89231d5fdd63c379fdf034",
-      "bytes": 21961
-    },
-    {
-      "path": "source/soma_rma_v1/body_tokenizer.py",
-      "sha256": "2492827998af5134962fbfd4de52c62b76a0337218b942f953316bca675c30c1",
-      "bytes": 9947
-    },
-    {
       "path": "source/soma_rma_v1/config.py",
-      "sha256": "7b944e55d67eb3a25761b81add766b29ca23446fd48f9c1bfa37a0e58ea09e70",
-      "bytes": 9040
+      "sha256": "7b9a4eec4e83bb3c8daf0ca725b20dffff314e7e2efaea85237bf7b52d2386a1",
+      "bytes": 8768
     },
     {
       "path": "source/soma_rma_v1/engine.py",
-      "sha256": "caf83d307fcc49caba89789ccffd9d556ed6c61db03072f476230657f2e93165",
-      "bytes": 111781
+      "sha256": "b88a97897ccb92e9bed0746f867acdedaccf1a9e9e8af8196264fa13fa32d3a5",
+      "bytes": 106366
     },
     {
       "path": "source/soma_rma_v1/foundation.py",
@@ -55,13 +45,13 @@
     },
     {
       "path": "source/soma_rma_v1/runtime.py",
-      "sha256": "ca92c14c801783fd3414b891e1d4c0348974ef8d97d1ea46bbefea0be69a5960",
-      "bytes": 80045
+      "sha256": "60671476f91557bbfed8df4818eb040eb81d00dd516c772cca5814cacd896430",
+      "bytes": 69007
     },
     {
       "path": "source/soma_rma_v1/soma_train_worker.py",
-      "sha256": "74fcb4e2e14e0171cf0cdb8f9b2c002e6e8374963eee438aa76568091fa9e4e3",
-      "bytes": 19971
+      "sha256": "ef65eadaf5ebeb9445fb18d12e3fd112c6fc8338bf5649c887570920b03723ce",
+      "bytes": 18696
     },
     {
       "path": "source/soma_rma_v1/tokenizer/soma-8k-v1.json",

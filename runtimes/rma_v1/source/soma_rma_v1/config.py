@@ -35,9 +35,8 @@ class RMAConfig:
     # exact recent tokens the cortex's sentinel pointer can copy from; used
     # only when a cortex is on (0 disables the pointer)
     readout_window: int = 256
-    # a pretrained body soma consults as an expert in its readout ("" for
-    # none).  With a body soma reads the body's alphabet and its width is the
-    # body's; io2 runs as it does without one.
+    # retired: rma no longer includes a transformer body. kept so the field
+    # loads; a model that used one is refused with a clear message.
     body: str = ""
 
     # full directional movement after one mean-gradient evidence update
@@ -52,12 +51,11 @@ class RMAConfig:
     # the predictor's temporal geometry and always follow `bands`.
     residual_bands: int = 0
 
-    # legacy metabolic-controller fields retained only so older checkpoints
-    # remain loadable. they no longer affect the learner clock.
+    # retired controller settings. io2 fixes the batch at evidence_quantum and
+    # sets traversal and plasticity from the residual spectrum, so these four
+    # have no effect; they stay only so checkpoints that recorded them load.
     batch_min: int = 8
     batch_max: int = 256
-
-    # source-time metabolism. defaults reproduce the validated controller.
     metabolic_relaxation_tokens: int = 11_520
     surprise_response_tokens: int = 58
 
@@ -94,11 +92,7 @@ class RMAConfig:
                 f"cortex_rate must be in (0, {CORTEX_RATE_CAP:g}]"
             )
         if self.body:
-            from .body import BODY_NAMES
-            if self.body not in BODY_NAMES:
-                raise ValueError(f"unknown body {self.body!r}")
-            if not self.cortex_depth:
-                raise ValueError("a body is consulted through the cortex readout")
+            raise ValueError("rma no longer includes a transformer body")
         if self.source_gain <= 0.0:
             raise ValueError("source_gain must be positive")
         if self.evidence_quantum < 1:
@@ -186,7 +180,6 @@ class RMAConfig:
             # temperature.  Batch metabolism controls evidence resolution;
             # this amplitude independently anneals movement per source token.
             lens_stride=1, io2_mode="full", io2_error_space="token",
-            body_gate=bool(self.body),
             residual_kernel="dense", io2_spectrum="proper",
             io2_sampling="corrected", io2_batch_map="spectral_frequency",
             io2_stride_cap=self.decimation_stride_cap,

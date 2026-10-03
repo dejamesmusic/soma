@@ -193,55 +193,30 @@ class Worker:
             except OSError:
                 pass
 
-    def build_model(self):
-        def requested_config(
-            width, bands, input_representation="adjacent_difference", body="",
-            width_scaling=None,
-        ):
-            return RMAConfig(
-                width=int(width), bands=int(bands),
-                input_representation=str(input_representation),
-                body=str(body),
-                cortex_width=int(self.config.get("cortex_width", 0)),
-                cortex_depth=int(self.config.get("cortex_depth", 0)),
-                workspace_tokens=int(self.config.get("workspace_tokens", 0)),
-                cortex_rate=float(self.config.get("cortex_rate", 1.0)),
-                readout_window=int(self.config.get(
-                    "readout_window", RMAConfig.readout_window
-                )),
-                source_gain=float(self.config.get("source_gain", 0.3)),
-                evidence_quantum=int(self.config.get("evidence_quantum", 64)),
-                decimation_stride_cap=int(
-                    self.config.get("decimation_stride_cap", 256)
-                ),
-                traversal_gain=float(self.config.get("traversal_gain", 1.0)),
-                batch_min=int(self.config.get("batch_min", 8)),
-                batch_max=int(self.config.get("batch_max", 256)),
-                metabolic_relaxation_tokens=int(
-                    self.config.get("metabolic_relaxation_tokens", 11_520)
-                ),
-                surprise_response_tokens=int(
-                    self.config.get("surprise_response_tokens", 58)
-                ),
-                # a continuation keeps its model's own scaling unless the run sets one
-                width_scaling=float(self.config.get(
-                    "width_scaling",
-                    RMAConfig.width_scaling if width_scaling is None else width_scaling,
-                )),
-            ).validate()
+    # what a run may set. a new model takes shape and dynamics from the run; a
+    # continuation keeps its own shape (a different one is refused) and takes
+    # dynamics from the run. anything the run leaves unset stays as it was.
+    SHAPE_SETTINGS = ("width", "bands", "cortex_width", "cortex_depth", "workspace_tokens", "readout_window")
+    DYNAMIC_SETTINGS = (("cortex_rate", float), ("source_gain", float), ("evidence_quantum", int),
+                        ("decimation_stride_cap", int), ("traversal_gain", float), ("width_scaling", float))
 
+    def requested_config(self, base):
+        values = base.public_dict()
+        for key in self.SHAPE_SETTINGS:
+            if str(self.config.get(key, "")).strip() != "":
+                values[key] = int(self.config[key])
+        for key, kind in self.DYNAMIC_SETTINGS:
+            if str(self.config.get(key, "")).strip() != "":
+                values[key] = kind(self.config[key])
+        return RMAConfig(**values).validate()
+
+    def build_model(self):
         checkpoint = str(self.config.get("checkpoint", "")).strip()
         if checkpoint:
             model = SOMA.from_checkpoint(
                 checkpoint, device=self.config.get("device", "auto")
             )
-            model.reconfigure_dynamics(requested_config(
-                self.config.get("width", model.config.width),
-                self.config.get("bands", model.config.bands),
-                model.config.input_representation,
-                model.config.body,
-                model.config.width_scaling,
-            ))
+            model.reconfigure_dynamics(self.requested_config(model.config))
             if self.config.get("fork", False):
                 self.event("saving", self.config["save_path"])
                 model.save_fork(self.config["save_path"])
@@ -250,12 +225,8 @@ class Worker:
             elif Path(checkpoint).resolve() != Path(self.config["save_path"]).resolve():
                 raise ValueError("continue mode must publish to the loaded checkpoint")
             return model
-        public = requested_config(
-            self.config.get("width", 256), self.config.get("bands", 32),
-            body=str(self.config.get("body", "")),
-        )
         model = SOMA(
-            public, device=self.config.get("device", "auto"),
+            self.requested_config(RMAConfig()), device=self.config.get("device", "auto"),
             seed=int(self.config.get("seed", 7)),
             description=str(self.config.get("description", "")),
         )
@@ -300,7 +271,6 @@ class Worker:
                 "params": self.model.params(),
                 "parameters": self.model.params(),
                 "bands": public["bands"], "width": public["width"],
-                "body": public["body"],
                 "cortex_width": public["cortex_width"],
                 "cortex_depth": public["cortex_depth"],
                 "workspace_tokens": public["workspace_tokens"],

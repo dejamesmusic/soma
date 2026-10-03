@@ -23,25 +23,14 @@ import torch.nn.functional as F
 
 from . import SPECIES
 from .config import PHI, RMAConfig
-from .engine import CorticalContext, Experiment, RESIDUAL_HISTORY_LENGTH, split_mixture
+from .engine import CorticalContext, Experiment, RESIDUAL_HISTORY_LENGTH
 from .protocol import TokenCorpus
 from .tokenizer import ReferenceTokenizer, TOKENIZER_NAME
-from .body import Body
-from .body_tokenizer import BodyTokenizer
-
-# The body's opinion before a token depends only on the tokens just before it:
-# every prediction it offers sees at least BODY_CONTEXT of them, read in fresh
-# windows that each serve up to BODY_SPAN positions (1.125 reads a token).  On
-# real conversation text, 1,024-2,048 tokens of context from a sliding cache
-# scored 0.8938 bpb; windows seeing 256-1,280 scored 0.8926 at 2.2x the
-# reading speed, and 256-2,304 scored 0.8827, 7% faster again.
-BODY_CONTEXT = 256
-BODY_SPAN = 2048
 
 
 
 RUNTIME_ID = "soma.rma_v1"
-RUNTIME_VERSION = "1.7.0"
+RUNTIME_VERSION = "1.8.0"
 CHECKPOINT_FORMAT = "soma-rma-v1-pytorch"
 CHECKPOINT_VERSION = 1
 TEXT_PROTOCOL_ID = "soma-text-turn-v1"
@@ -209,25 +198,7 @@ class SOMA:
     ) -> None:
         self.config = (config or RMAConfig()).validate()
         self.device = resolve_device(device)
-        self.body = None
-        # the body's recent stream, its hidden state at the end of it once its
-        # generation cache has been synced, and whether it has
-        self._body_recent: list[int] = []
-        self._body_hidden = None
-        self._body_synced = False
-        self._last_body_share = None
-        if self.config.body:
-            self.body = Body(
-                self.config.body, device=self.device,
-                context=BODY_CONTEXT + BODY_SPAN, keep=BODY_CONTEXT,
-            )
-            if self.body.width != self.config.width:
-                raise ValueError(
-                    f"soma's width must be its body's ({self.body.width})"
-                )
-            self.tokenizer = BodyTokenizer(self.body.directory)
-        else:
-            self.tokenizer = ReferenceTokenizer(tokenizer_path)
+        self.tokenizer = ReferenceTokenizer(tokenizer_path)
         torch.manual_seed(int(seed))
         np.random.seed(int(seed))
         args = self.config.experiment_namespace(
@@ -237,14 +208,6 @@ class SOMA:
         self.engine = Experiment(args, "global_clocked", self.tokenizer)
         if self.engine.model.vocab != self.tokenizer.vocab_size:
             raise ValueError("model and tokenizer vocabularies differ")
-        if self.body is not None:
-            # soma starts from its body's token geometry and keeps learning it
-            dictionary = self.net.input_dictionary.weight
-            with torch.no_grad():
-                dictionary.copy_(self.body.embedding.float())
-            self.engine.learner.matrix_radii[id(dictionary)] = float(
-                dictionary.detach().square().sum().sqrt()
-            )
         self.description = str(description)
         self.checkpoint_id = uuid.uuid4().hex
         self.revision_id = uuid.uuid4().hex
@@ -317,7 +280,7 @@ class SOMA:
         """Apply editable runtime dynamics without rebuilding learned state.
 
         Width and temporal bands define the checkpoint tensors and therefore
-        cannot change in place.  The remaining public controls are metabolic:
+        cannot change in place.  The remaining public controls are dynamics:
         they are expected to take effect when a checkpoint is continued.
         """
         config = config.validate()
@@ -325,8 +288,6 @@ class SOMA:
             raise ValueError(
                 "checkpoint width and temporal bands cannot change in continue mode"
             )
-        if config.body != self.config.body:
-            raise ValueError("a body can only be chosen for a new model")
         if config.input_representation != self.config.input_representation:
             raise ValueError(
                 "input representation can only be chosen for a new model"
@@ -485,126 +446,6 @@ class SOMA:
             torch.from_numpy(inverse.reshape(grid.shape)).to(self.device),
         )
 
-    # ------------------------------------------------------------------ body
-
-    def _body_expand(self, ids):
-        """the body's stream for ids (controls as their text renderings), the
-        index in it of the token before each id, and which ids are controls."""
-        renderings = self.tokenizer.control_renderings
-        expanded, before, control = [], [], []
-        for token in np.asarray(ids, dtype=np.int64).tolist():
-            rendering = renderings.get(token)
-            before.append(len(expanded) - 1)
-            control.append(rendering is not None)
-            expanded.extend(rendering if rendering is not None else (token,))
-        return expanded, np.asarray(before, dtype=np.int64), np.asarray(control, dtype=bool)
-
-    def _advance_body(self, stream):
-        self._body_recent = list(stream[-BODY_CONTEXT:])
-        self._body_synced = False
-        self._body_hidden = None
-
-    def _body_rows(self, ids, rows):
-        """the body's final hidden state before each row of ids, read in fresh
-        windows over its recent stream and ids; which rows have one (all but
-        the first token it ever sees) and which are controls.  Only the rows
-        are read for: tokens no row reaches are skipped.  The stream then
-        advances past ids."""
-        expanded, before, control = self._body_expand(ids)
-        stream = self._body_recent + expanded
-        at = len(self._body_recent) + before[np.asarray(rows, dtype=np.int64)]
-        known = at >= 0
-        hidden = torch.zeros(len(at), self.body.width, device=self.device, dtype=self.body.dtype)
-        if known.any():
-            hidden[torch.from_numpy(known).to(self.device)] = self.body.hidden_at(
-                stream, at[known].tolist(), BODY_CONTEXT, BODY_SPAN,
-            )
-        self._advance_body(stream)
-        return (
-            hidden, torch.from_numpy(known).to(self.device),
-            torch.from_numpy(control[np.asarray(rows, dtype=np.int64)]).to(self.device),
-        )
-
-    def _body_opinions(self, ids, rows):
-        """the body's (log p given text, entropy, top log p) at each row, which
-        rows are controls (there the body abstains), and each row's whole
-        log-distribution (so accuracy can be the whole model's)."""
-        hidden, known, control = self._body_rows(ids, rows)
-        targets = torch.as_tensor(
-            np.asarray(ids, dtype=np.int64)[np.asarray(rows, dtype=np.int64)], device=self.device
-        )
-        logp, entropy, top, whole = self.body.opinion(
-            hidden, targets, exclude=self._controls, full=True
-        )
-        uniform = math.log(self.body.vocab)
-        logp = torch.where(known, logp, torch.full_like(logp, -uniform))
-        entropy = torch.where(known, entropy, torch.full_like(entropy, uniform))
-        top = torch.where(known, top, torch.full_like(top, -uniform))
-        whole = torch.where(known[:, None], whole, torch.full_like(whole, -uniform))
-        return logp.clamp(-1e4, -1e-6).float(), entropy.float(), top.float(), control, whole
-
-    def _body_observe(self, ids):
-        """advance the body's stream without asking its opinion.  While
-        generating, its cache steps along; otherwise nothing is read."""
-        expanded, _, control = self._body_expand(ids)
-        if self._body_synced and len(ids) == 1 and not control[0]:
-            self._body_hidden = self.body.step(int(ids[0]))
-            self._body_recent = (self._body_recent + expanded)[-BODY_CONTEXT:]
-        else:
-            self._advance_body(self._body_recent + expanded)
-
-    def _sync_body(self):
-        """bring the body's generation cache to the end of its stream."""
-        if not self._body_synced:
-            self._body_hidden = self.body.restore(self._body_recent)
-            self._body_synced = True
-
-    @property
-    def _controls(self):
-        if getattr(self, "_control_tensor", None) is None:
-            self._control_tensor = torch.as_tensor(
-                sorted(self.tokenizer.control_ids.values()), device=self.device
-            )
-        return self._control_tensor
-
-    def _split_mixture(self, soma_log, body_log, share):
-        """full log-distribution: controls priced by soma alone, text shared
-        with the body; rows of log-probabilities in, rows out."""
-        return split_mixture(soma_log, body_log, share, self._controls)
-
-    def _body_state(self):
-        synced = self._body_synced
-        return list(self._body_recent), synced, list(self.body.tokens) if synced else None
-
-    def _restore_body(self, state):
-        recent, synced, tokens = state
-        self._advance_body(recent)
-        if synced:
-            self._body_hidden = self.body.restore(tokens)
-            self._body_synced = True
-
-    def _body_share(self) -> float:
-        """mean share of the next token handed to the body, lately."""
-        if self.body is None:
-            return 0.0
-        if self.engine.last_body_share is not None:
-            return float(self.engine.last_body_share)
-        return float(self._last_body_share or 0.0)
-
-    @torch.no_grad()
-    def _body_mixture(self, languages, soma_log):
-        """log of (1 - g) p_soma + g p_body at the present position."""
-        self._sync_body()
-        if self._body_hidden is None:
-            return soma_log
-        body_log = torch.log_softmax(self.body.logits(self._body_hidden), -1)
-        entropy = -(body_log.exp() * body_log).sum(-1)
-        share = self.net.body_gate(
-            self.net.summed_language(languages), entropy, body_log.max(-1).values
-        )
-        self._last_body_share = float(share.mean())
-        return self._split_mixture(torch.log_softmax(soma_log.float(), -1), body_log, share)
-
     def _cortical_history(self, ids, rows):
         workspace = self._history_windows(ids, rows)
         if not self._readout_lags():
@@ -671,8 +512,6 @@ class SOMA:
         self._pending_stride = None
         first_row = (-int(engine.tokens_seen)) % stride
         rows = np.arange(first_row, actual_batch, stride, dtype=np.int64)
-        # the body is asked only at the rows io2 trains on
-        opinions = self._body_opinions(ids, rows) if self.body is not None else None
         if not len(rows):
             with torch.no_grad():
                 engine.bank.process_block_select(
@@ -687,11 +526,6 @@ class SOMA:
                 engine.learner.base_lr, engine.residual_surprise,
             )
         history_ids = self._cortical_history(ids, rows)
-        if opinions is not None:
-            if not isinstance(history_ids, CorticalContext):
-                history_ids = CorticalContext(workspace=history_ids)
-            history_ids.body = opinions
-            history_ids.controls = self._controls
         targets = torch.from_numpy(ids[rows]).to(self.device)
         weights = torch.from_numpy(weights_np[rows]).to(self.device)
         # The weights are host data; summing them here avoids a device sync.
@@ -930,9 +764,6 @@ class SOMA:
         saved_trace = None if stateful else self.engine.bank.traces.clone()
         saved_tokens = None if stateful else self.engine.tokens_seen
         saved_workspace = None if stateful else list(self._workspace_ids)
-        saved_body = (
-            self._body_state() if self.body is not None and not stateful else None
-        )
         try:
             self._observe_control("dream")
             return self.generate_text(length=length, temperature=temperature)
@@ -941,8 +772,6 @@ class SOMA:
                 self.engine.bank.traces.copy_(saved_trace)
                 self.engine.tokens_seen = saved_tokens
                 self._workspace_ids = saved_workspace
-            if saved_body is not None:
-                self._restore_body(saved_body)
 
     def training_report(self, totals, reader, started, epoch=1, epochs=1) -> dict:
         elapsed = max(EPS, time.time() - started)
@@ -964,10 +793,8 @@ class SOMA:
             "life_bytes": int(self.bytes_seen), "life_tokens": int(self.tokens_seen),
             "updates": int(engine.learner.steps),
             "batch": int(self.batch_size),
-            "batch_mean": float(engine.dynamic_batch_sum / max(1, engine.dynamic_batch_count)),
-            "batch_min_observed": engine.dynamic_batch_min,
-            "batch_max_observed": engine.dynamic_batch_max,
-            "metabolic_band": float(engine.io2_decimation_band),
+            # io2's traversal: phi ** band source tokens between trained predictions
+            "traversal_band": float(engine.io2_decimation_band),
             "prediction_stride": int(max(1, round(
                 PHI ** engine.io2_decimation_band
             ))),
@@ -979,12 +806,11 @@ class SOMA:
             "evidence_quantum": int(self.config.evidence_quantum),
             "evidence_accumulated": float(engine.optimizer_prediction_mass),
             "controller_bands": int(engine.error_bank.n_bands),
-            "residual_surprise": float(engine.residual_surprise),
-            "residual_surprise_max": float(engine.residual_surprise_max),
             "source_gain": float(self.config.source_gain),
             "plasticity_ratio": float(engine.io2_ratio),
+            # what one update moves now: the setting, scaled for width, times plasticity
             "effective_source_gain": float(
-                self.config.source_gain * engine.io2_ratio
+                self.config.source_gain * self.config.width_rate * engine.io2_ratio
             ),
             "effective_learning_rate": float(engine.learner.base_lr),
             "norm_match": float(engine.learner.last_norm_match),
@@ -995,13 +821,17 @@ class SOMA:
                 float(self.net.recent_readout.last_share)
                 if self.net.recent_readout is not None else 0.0
             ),
-            "body": self.config.body,
-            "body_share": self._body_share(),
             "parameters": self.params(),
         }
         report["session_seconds"] = elapsed
-        report["life_seconds"] = elapsed
-        report["recent_bpb"] = report["bpb"]
+        # bits per byte since the previous report (the session's so far on the first)
+        mark = getattr(self, "_report_mark", None)
+        nll, nll_bytes = float(totals["nll"]), float(totals["loss_bytes"])
+        if mark and mark[0] == started and nll_bytes > mark[2]:
+            report["recent_bpb"] = (nll - mark[1]) / ((nll_bytes - mark[2]) * math.log(2.0))
+        else:
+            report["recent_bpb"] = report["bpb"]
+        self._report_mark = (started, nll, nll_bytes)
         report["residual_spectrum"] = list(engine.io2_whitened_spectrum)
         report["residual_excess"] = list(engine.io2_excess_spectrum)
         baseline = engine.residual_spectrum_baseline
@@ -1121,14 +951,11 @@ class SOMA:
         changes the model."""
         saved_trace = self.engine.bank.traces.clone()
         saved_workspace = list(self._workspace_ids)
-        saved_body = self._body_state() if self.body is not None else None
         totals = dict(nll=0.0, loss_bytes=0.0, loss_tokens=0.0,
                       correct=0.0, top5=0.0, source_bytes=0, tokens=0)
         if not carry_state:
             self.engine.bank.reset()
             self._workspace_ids = []
-            if saved_body is not None:
-                self._advance_body([])
         try:
             with TokenCorpus(
                 corpus_path, self.tokenizer, start_byte=start_byte,
@@ -1141,10 +968,6 @@ class SOMA:
                     ids, source_bytes, _ = block
                     rows = np.arange(len(ids), dtype=np.int64)
                     history_ids = self._cortical_history(ids, rows)
-                    if saved_body is not None:
-                        # the full mixture at every row, from the body's
-                        # states before each token, projected in chunks
-                        states, known, _ = self._body_rows(ids, rows)
                     features = self.engine.bank.process_block_select(
                         ids, self.net.input_dictionary, rows=rows
                     )
@@ -1154,10 +977,6 @@ class SOMA:
                     prediction = self.net.summed_prediction(
                         languages, history_ids
                     )
-                    if saved_body is not None:
-                        prediction = self._evaluation_mixture(
-                            languages, prediction, states, known
-                        )
                     self._advance_workspace(ids)
                     per_token = F.cross_entropy(prediction, targets, reduction="none")
                     weight_sum = float(weights.sum())
@@ -1172,8 +991,6 @@ class SOMA:
         finally:
             self.engine.bank.traces.copy_(saved_trace)
             self._workspace_ids = saved_workspace
-            if saved_body is not None:
-                self._restore_body(saved_body)
         return EvaluationMetrics(
             bpb=totals["nll"] / max(EPS, totals["loss_bytes"] * math.log(2.0)),
             token_loss=totals["nll"] / max(EPS, totals["loss_tokens"]),
@@ -1182,25 +999,9 @@ class SOMA:
             source_bytes=int(totals["source_bytes"]), tokens=int(totals["tokens"]),
         )
 
-    @torch.no_grad()
-    def _evaluation_mixture(self, languages, soma_prediction, states, known):
-        soma_log = torch.log_softmax(soma_prediction.float(), -1)
-        language = self.net.summed_language(languages)
-        out = soma_log.clone()
-        for lo in range(0, len(soma_log), 256):
-            hi = min(len(soma_log), lo + 256)
-            body_log = torch.log_softmax(self.body.logits(states[lo:hi]), -1)
-            entropy = -(body_log.exp() * body_log).sum(-1)
-            share = self.net.body_gate(language[lo:hi], entropy, body_log.max(-1).values)
-            mixed = self._split_mixture(soma_log[lo:hi], body_log, share)
-            out[lo:hi] = torch.where(known[lo:hi, None], mixed, soma_log[lo:hi])
-        return out
-
     def observe_ids(self, ids) -> None:
         ids = np.asarray(ids, dtype=np.int64)
         if len(ids):
-            if self.body is not None:
-                self._body_observe(ids)
             self.engine.bank._advance_exact(ids)
             self._advance_workspace(ids)
             self.engine.tokens_seen += len(ids)
@@ -1301,8 +1102,6 @@ class SOMA:
         prediction = self.net.summed_prediction(
             languages, self._current_cortical_history()
         )
-        if self.body is not None:
-            prediction = self._body_mixture(languages, prediction)
         return prediction[0]
 
     def _generation_tokens(self, length, temperature, greedy=False):
@@ -1312,13 +1111,6 @@ class SOMA:
             raise ValueError("temperature must be positive")
         forbidden = list(self.tokenizer.generation_forbidden_ids)
         turn_id = self.tokenizer.control_ids["turn"]
-        # A body reads the user control as text; writing that text itself is
-        # the body handing the turn back.  Tokens that could still become it
-        # are held, and dropped if they do.
-        handback = (
-            getattr(self.tokenizer, "handback_text", "") if self.body is not None else ""
-        )
-        held = []
         ended = False
         try:
             for _ in range(int(length)):
@@ -1333,16 +1125,7 @@ class SOMA:
                 if token_id == turn_id:
                     ended = True
                     break
-                if not handback:
-                    yield token_id
-                    continue
-                held.append(token_id)
-                if handback in self.tokenizer.decode(held):
-                    held = []
-                    break
-                while held and not handback.startswith(self.tokenizer.decode(held)):
-                    yield held.pop(0)
-            yield from held
+                yield token_id
         finally:
             if not ended:
                 self.observe_ids([turn_id])
@@ -1371,8 +1154,7 @@ class SOMA:
             "bytes_seen": self.bytes_seen, "tokens_seen": self.tokens_seen,
             "batch": self.batch_size,
             "controller_bands": int(engine.error_bank.n_bands),
-            "metabolic_band": float(engine.io2_decimation_band),
-            "residual_surprise": float(engine.residual_surprise),
+            "traversal_band": float(engine.io2_decimation_band),
             "norm_match": float(engine.learner.last_norm_match),
             "cortex_gain": float(engine.learner.cortex_gain),
             "cortex_rate": float(self.config.cortex_rate),
@@ -1381,8 +1163,6 @@ class SOMA:
                 float(self.net.recent_readout.last_share)
                 if self.net.recent_readout is not None else 0.0
             ),
-            "body": self.config.body,
-            "body_share": self._body_share(),
             "workspace_fill": len(self._workspace_ids),
             "maximum_radius_error": self._maximum_radius_error(),
             "finite": all(bool(torch.isfinite(p).all()) for p in self.net.parameters()),
@@ -1440,12 +1220,7 @@ class SOMA:
             "revision_history": revision_history,
             "forked_from_checkpoint_id": self.forked_from_checkpoint_id,
             "forked_from_revision_id": self.forked_from_revision_id,
-            "tokenizer_name": self.config.body or TOKENIZER_NAME,
-            "body_tokens": (
-                [] if self.body is None
-                else list(self.body.tokens) if self._body_synced
-                else list(self._body_recent)
-            ),
+            "tokenizer_name": TOKENIZER_NAME,
             "tokenizer_sha256": self.tokenizer.sha256,
             "model": {key: value.detach().cpu() for key, value in self.net.state_dict().items()},
             "pending_gradients": {
@@ -1551,9 +1326,6 @@ class SOMA:
             "evidence_quantum": self.config.evidence_quantum,
             "decimation_stride_cap": self.config.decimation_stride_cap,
             "traversal_gain": self.config.traversal_gain,
-            "batch_min": self.config.batch_min, "batch_max": self.config.batch_max,
-            "metabolic_relaxation_tokens": self.config.metabolic_relaxation_tokens,
-            "surprise_response_tokens": self.config.surprise_response_tokens,
             "config": self.config.public_dict(),
             "bytes_seen": self.bytes_seen, "tokens_seen": self.tokens_seen,
             "tokenizer": TOKENIZER_NAME, "tokenizer_sha256": self.tokenizer.sha256,
@@ -1629,6 +1401,11 @@ class SOMA:
         saved_config.setdefault("width_scaling", 0.0)
         # a body's stride briefly had its own setting; io2 owns it again
         saved_config.pop("body_stride", None)
+        if saved_config.get("body"):
+            raise ValueError(
+                "this model reads through a transformer body, which rma no longer includes "
+                "(rma 1.7 and earlier open it)"
+            )
         if "evidence_quantum" not in saved_config:
             saved_config["evidence_quantum"] = {
                 128: 512, 256: 256, 384: 128, 512: 64,
@@ -1706,12 +1483,6 @@ class SOMA:
         model.forked_from_revision_id = checkpoint.get("forked_from_revision_id")
         model.created_at = float(checkpoint.get("created_at", time.time()))
         model._source_cursor = checkpoint.get("source_cursor")
-        if model.body is not None:
-            # the body's state is its recent stream: re-read it
-            tokens = [int(t) for t in checkpoint.get("body_tokens", [])]
-            model._body_recent = tokens[-BODY_CONTEXT:]
-            model._body_hidden = model.body.restore(tokens)
-            model._body_synced = True
         model._loaded_checkpoint_path = path
         model._revision_published = True
         torch.set_rng_state(checkpoint["torch_rng_state"])

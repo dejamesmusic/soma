@@ -48,7 +48,9 @@ recent `w` tokens are available to the cortical mixer as full-resolution lag ban
 ordered `t-1 ... t-w`, and every token also enters the temporal trace field on arrival,
 so the base predictor sees the whole stream whether or not a cortex is attached. an
 earlier partitioned layout, which withheld the last `w` tokens from the base, cost
-0.195 bits per byte against no cortex at all; the overlapping layout gains 0.030.
+0.195 bits per byte against no cortex at all; the overlapping layout gains 0.030. new
+models no longer choose exact bands: the pointer (`readout_window`) reads recent tokens
+instead, and does more with them (below).
 
 new models use `adjacent_difference`. checkpoints created by runtime 1.1 and earlier
 are explicitly restored as `cross_band`, preserving the coordinates in which their
@@ -60,8 +62,11 @@ weights learned. input representation cannot change during continuation.
 - `bands`: temporal extent, with aperture cutoffs derived from the phi geometry;
 - `cortex_width` and `cortex_depth`: optional present-time nonlinear capacity over
   the unsummed aperture opinions;
-- `workspace_tokens`: the number of full-resolution exact lag bands available to the
-  optional frontal cortical mixer, alongside the full temporal field;
+- `workspace_tokens` (no longer a choice): full-resolution exact lag bands for the cortical
+  mixer. a model that has them keeps them, but new models leave it at 0 and read recent
+  tokens through the pointer: 16 exact bands added 0.0008 bpb in the cortical graft control
+  (2026-09-20), while a 256-token pointer window took the cortex's held-out gain from -0.042
+  to -0.098 bpb;
 - the cortical proposal is bounded smoothly so it never exceeds the base language
   state in size, and trust admits it through tanh(softplus(x)), which lies in (0, 1):
   closing trust removes the proposal instead of subtracting it. the fixed-radius
@@ -90,34 +95,6 @@ weights learned. input representation cannot change during continuation.
   top-1/top-5 come from the target's exact rank, and pointer keys are projected only
   for the distinct tokens in the window. values and gradients match the full mixture;
   at a 49k vocabulary this took a training step from 758 to 1275 tokens/s;
-- `body`: a small pretrained transformer soma consults ("" for none; the bundled body is
-  `smollm2-135m`, Apache-2.0, 134.5m frozen parameters in `bodies/`). soma then reads
-  the body's alphabet (`body_tokenizer.py`, byte-level BPE matching HuggingFace token for
-  token), its width is the body's (576), its dictionary starts as the body's embeddings
-  and keeps learning, and a cortex is required. the body reads every token soma reads
-  and offers its prediction as an expert in soma's readout, admitted by a learned gate
-  from soma's language and the body's own confidence: p(x) = (1 - g) p_soma(x) +
-  g (1 - P_soma(controls)) p_body(x | text), while each control keeps soma's own
-  probability. controls are soma's protocol, so the body reads them as text ("\nUser: ",
-  "\nSoma: ", "\n") and never prices them; when the body writes "\nUser:" itself it is
-  handing the turn back, and generation ends the turn there. the gate carries a fixed
-  prior of +4 (a new soma starts with about 2% of the vote, like the pointer's sentinel
-  offset) and soma earns trust as it learns. training reads each loss at the target only
-  (the body's log-probability of the true token is all a mixture's loss needs). the
-  body's opinion before a token depends only on the tokens just before it, so for learning
-  it holds no state: it reads fresh windows, batched, each starting at least 256 tokens
-  before the first position it serves and serving up to 2,048 (1.125 reads a token), and
-  only at the positions io2 trains on. a gap between trained rows wider than 256 starts a
-  fresh window, so a row costs min(gap, 257) tokens of reading: below that the rows'
-  contexts overlap and every token is computed once, which is why an update's body time
-  grows with io2's stride (at stride 32 it reads about 7,400 tokens, 1.5 s of a 1.8 s
-  update). on conversation text, windows seeing 256-2,304 tokens scored 0.8827 bpb
-  against 0.8938 for 1,024-2,048 from the earlier cache, and soma with the body trained
-  at 4,300 tokens/s against 1,830. its whole state is its last 256 stream tokens, kept in the checkpoint;
-  generation syncs a bounded cache from them and steps it. on MPS its decode step is fused (one-token matvecs at memory bandwidth, SwiGLU in the
-  gate/up pass, rotary embedding with the cache write, residual-add with RMSNorm):
-  3.9 ms a token against 34 ms in HuggingFace. on 1m tokens of real messages the body alone scored 1.187 bpb and soma with the
-  body 1.145, the gain growing from 0.9% in the first fifth to 6.5% in the last;
 - chat learns as training does, with two differences: no decimation and variable
   batches. each prompt (with its markers, which carry no loss) is one batch trained at
   every position and closed by one update, scaled by source time: in corpus training every
@@ -125,9 +102,7 @@ weights learned. input representation cannot change during continuation.
   (quantum / density tokens), so a chat update spanning n source tokens moves
   n x density / quantum of a corpus update, and a prompt longer than that span closes one
   equal update per span. io2 keeps observing chat, so its density and plasticity are the
-  live ones. with a body, io2 runs exactly as without one; decimation leaves the mixture no
-  worse than the body alone once the gate's prior holds a sparsely trained soma nearly shut
-  (at cap 32 it had been 2.7% worse without the prior);
+  live ones;
 - `source_gain`: full directional movement of one optimizer update;
 - `evidence_quantum`: fixed batch of admitted predictions per optimizer update;
 - `decimation_stride_cap`: maximum source-token distance between admitted errors;
@@ -139,6 +114,12 @@ weights learned. input representation cannot change during continuation.
   with spikes to 0.21), and models diverged past width ~3000 with or without io2; at 0.5 the
   effect stays near the 256-wide value (0.020 at 512, 0.026 at 1024) and the spikes go
   (`experiments/width_scaling.py`, `experiments/WIDTH_SCALING_RESULTS_2026-10-02.md`).
+
+`batch_min`, `batch_max`, `metabolic_relaxation_tokens` and `surprise_response_tokens`
+belonged to an earlier controller that sized the batch itself. io2 fixes the batch at
+`evidence_quantum` and sets traversal and plasticity from the residual spectrum, so they
+have no effect; they are kept only so older checkpoints load. rma no longer includes a
+transformer body (1.8): a model trained with one opens in 1.7 and earlier.
 
 the slow clock, evidence-normalized update law, activation budget, matrix radii,
 whitening response, and controller source-time conversion are derived invariants rather
@@ -217,9 +198,11 @@ plasticity changes response amplitude and never rescales the temporal coordinate
 ## application reporting
 
 the live report is expressed in source time. it includes prequential bits per source
-byte, token loss and accuracy, source bytes and tokens per second, fixed batch size, prediction stride, io2 band, normalized residual surprise,
-effective source gain, plasticity ratio, update rate, norm-match compensation, updates,
-and session source experience.
+byte (the session's, and since the previous report), token loss and accuracy, source
+bytes and tokens per second, the fixed batch, io2's traversal band and prediction stride,
+the plasticity ratio, the effective source gain (the setting scaled for width, times
+plasticity: what one update moves now), the update rate, norm-match compensation, updates,
+the pointer's window and share, and session source experience.
 
 the io2 residual bank uses exactly the predictor band count, keeping measurement
 and representation on one temporal geometry.
