@@ -30,7 +30,7 @@ from .tokenizer import ReferenceTokenizer, TOKENIZER_NAME
 
 
 RUNTIME_ID = "soma.rma_v1"
-RUNTIME_VERSION = "1.8.0"
+RUNTIME_VERSION = "1.8.1"
 CHECKPOINT_FORMAT = "soma-rma-v1-pytorch"
 CHECKPOINT_VERSION = 1
 TEXT_PROTOCOL_ID = "soma-text-turn-v1"

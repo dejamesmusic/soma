@@ -1,7 +1,7 @@
 {
   "protocolVersion": 1,
   "id": "soma.rma_v1",
-  "version": "1.8.0",
+  "version": "1.8.1",
   "name": "rma v1",
   "description": "residual metabolic aperture · 8k alphabet · directional temporal bands",
   "python": "/Library/Frameworks/Python.framework/Versions/3.11/bin/python3",
@@ -14,7 +14,7 @@
   "checkpoint": {
     "format": "soma-rma-v1-pytorch",
     "compatibility": "exact-runtime",
-    "opens": ["1.6.0", "1.6.1", "1.6.2", "1.6.3", "1.6.4", "1.7.0"],
+    "opens": ["1.6.0", "1.6.1", "1.6.2", "1.6.3", "1.6.4", "1.7.0", "1.8.0"],
     "cursorPolicy": "resume-saved",
     "lineage": true
   },
@@ -42,6 +42,7 @@
     {"key":"evidence_quantum","label":"batch","type":"integer","value":"256","group":"dynamics"},
     {"key":"decimation_stride_cap","label":"max traversal","type":"integer","value":"256","group":"dynamics"},
     {"key":"traversal_gain","label":"traversal gain","type":"number","value":"1","group":"dynamics"},
+    {"key":"width_scaling","label":"width scaling","type":"number","value":"0.5","options":["0","0.25","0.5"],"absent":"0","group":"dynamics"},
     {"key":"epochs","label":"passes","type":"integer","value":"1","group":"feed"},
     {"key":"max_bytes","label":"max source bytes","type":"integer","value":"0","group":"feed"},
     {"key":"start_byte","label":"source byte","type":"integer","value":"0","group":"feed"},

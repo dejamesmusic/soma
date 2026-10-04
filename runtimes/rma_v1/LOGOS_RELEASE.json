@@ -1,12 +1,12 @@
 {
  "runtime_id": "soma.rma_v1",
- "version": "1.8.0",
- "released": "2026-10-03",
+ "version": "1.8.1",
+ "released": "2026-10-04",
  "files": [
   {
-   "name": "soma-rma-v1-1.8.0.tar.gz",
-   "sha256": "51389b6ad08cce8c124c5e1f04e6e22144e7fdff843e2d5756f2533ebd33693e"
+   "name": "soma-rma-v1-1.8.1.tar.gz",
+   "sha256": "ddbe58fdecad98790c75955cbb3c5d1e93dbdb99906ace04f78f1bc5289b7ee0"
   }
  ],
- "source": "https://logossoma.com/api/runtimes/soma.rma_v1/releases/1.8.0"
+ "source": "https://logossoma.com/api/runtimes/soma.rma_v1/releases/1.8.1"
 }

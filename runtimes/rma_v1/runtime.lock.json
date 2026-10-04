@@ -1,12 +1,12 @@
 {
   "lockVersion": 1,
-  "runtime": "soma.rma_v1@1.8.0",
-  "digest": "ef7ef6943995cd0647b4214dc4f0f6c3d3e284942b115e1b29b8bbe48291adc7",
+  "runtime": "soma.rma_v1@1.8.1",
+  "digest": "3d04290303edd7a8818571dac650410c801148d23b18bfb08e0c7ce1daf57ee0",
   "files": [
     {
       "path": "runtime.json",
-      "sha256": "0fd45267e7ebccc88b041a7760ed17c53b7080f98865dbc5c620cfc1ec6bf702",
-      "bytes": 3327
+      "sha256": "fe17d72a03efb921e2ae4c456912175e9d53444a82cc867db4cf7e71e7eaa0a9",
+      "bytes": 3480
     },
     {
       "path": "source/requirements.txt",
@@ -45,7 +45,7 @@
     },
     {
       "path": "source/soma_rma_v1/runtime.py",
-      "sha256": "60671476f91557bbfed8df4818eb040eb81d00dd516c772cca5814cacd896430",
+      "sha256": "e347d7a9c810772fd5f6296964ebdeb80eae35942ffa3fa4d54f380affb45fbc",
       "bytes": 69007
     },
     {
