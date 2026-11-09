@@ -43,7 +43,7 @@ class Block(torch.nn.Module):
 
 
 class Learner2(torch.nn.Module):
-    def __init__(self, V, W, D, H, DP, O, NB, depth=1):
+    def __init__(self, V, W, D, H, DP, O, NB, depth=1, final_norm=0):
         super().__init__()
         self.emb = torch.nn.Embedding(V, D)
         self.win = torch.nn.Linear(W * D, H)
@@ -52,6 +52,10 @@ class Learner2(torch.nn.Module):
         self.cell = torch.nn.Linear(O * NB * (DP + 1), H, bias=False)
         self.l2 = torch.nn.Linear(H, H)
         self.blocks = torch.nn.ModuleList([Block(H, H) for _ in range(max(0, int(depth) - 1))])
+        # final_norm (1.0.1): a LayerNorm on the residual stream before the output. without it the stream is unnormalised
+        # and Adam's first steps on the zero-initialised block outputs kick it to norms in the thousands (2048x3 survived
+        # the transient; 4096x4 diverged). checkpoints made before it load with final_norm 0 and are unchanged.
+        self.ln_f = torch.nn.LayerNorm(H) if final_norm else None
         self.out = torch.nn.Linear(H, V)
         self.keep_h, self.h = False, None
 
@@ -61,6 +65,8 @@ class Learner2(torch.nn.Module):
         h = torch.nn.functional.gelu(self.l2(h))
         for b in self.blocks:
             h = b(h)
+        if self.ln_f is not None:
+            h = self.ln_f(h)
         if self.keep_h and h.requires_grad:
             h.retain_grad()
             self.h = h
@@ -72,7 +78,7 @@ class Core2(_Core):
         super().__init__(cfg, dev, blen, parity=False)
         c = self.c
         self.net = Learner2(self.V, int(c["window"]), int(c["emb"]), int(c["hidden"]), int(c["proj"]), self.O,
-                            self.NB, depth=int(c.get("depth", 1))).to(self.dev)
+                            self.NB, depth=int(c.get("depth", 1)), final_norm=int(c.get("final_norm", 0))).to(self.dev)
         self.opt = torch.optim.Adam(self.net.parameters(), lr=float(c["lr"]), fused=self.dev.type in ("mps", "cuda"))
         # the rung and match weights: SGD at mix_lr * C (core.py) takes one large step per tick and overshoots at
         # large ticks; Adam's step does not scale with the tick (mix_opt 'adam', lr mix_adam)

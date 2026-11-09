@@ -92,7 +92,8 @@ class IO2:
     def ratio_for(self, token_loss: float) -> float:
         plast = 2.5 * math.sqrt(self.energy) * (0.25 + 0.75 * math.sqrt(self.coherence))
         chance = math.log(self.vocab)
-        plast *= max(1.0 / self.base, min(self.base, self.base ** ((float(token_loss) - chance) / chance)))
+        x = (float(token_loss) - chance) / chance                       # clamped first: a diverged loss must not overflow
+        plast *= self.base ** (max(-1.0, min(1.0, x)) if x == x else 1.0)
         return max(0.02, min(1.0, plast))
 
     # ---- actuation, once per canonical quantum of predictions ----

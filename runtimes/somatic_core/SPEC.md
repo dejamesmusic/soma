@@ -1,4 +1,4 @@
-# somatic core 1.0.0: runtime specification
+# somatic core 1.0.1: runtime specification
 
 *Runtime `soma.somatic_core`, species `somatic_core`, checkpoint format `somatic-core-pytorch` (checkpoint version 1),
 tokenizer soma-8k-v1 (8192 tokens). Theory: `THEORY.md`. Measurements: `RESULTS.md`.*
@@ -54,7 +54,8 @@ A per-position network. It does not mix across positions, and it has no recurren
 - for every order and rung, the exact reader's chain projected through a learned token projection (`proj`, 16), with
   log totals.
 
-It has `depth` layers of width `hidden`, and an output layer onto 8192 tokens. It is trained on its own loss with AdamW
+It has `depth` layers of width `hidden` (after the first two, pre-LayerNorm residual blocks), a final LayerNorm
+(`final_norm`, added in 1.0.1), and an output layer onto 8192 tokens. It is trained on its own loss with AdamW
 (weight decay `wd`), gradient clipping at 1, and soft radial compression of every row (§7). Its output is `p_learned`.
 
 **The prediction.** p = s · p_exact + (1 − s) · p_learned. The gate s is learned per key (deepest order, match length,
@@ -105,6 +106,7 @@ Every number the learner carries is bounded. The checkpoint is fixed-size for a 
 |---|---|---|
 | `hidden` | 2048 | learner width (the cloud agent's `width` is accepted as an alias) |
 | `depth` | 3 | learner layers |
+| `final_norm` | 1 | a LayerNorm before the output; checkpoints from before 1.0.1 open with 0 |
 | `p2`, `p3` | 1048576, 2097152 | order-2 and order-3 context pools |
 | `np1`, `np2`, `np3` | 1048576, 4194304, 8388608 | pair pools per order |
 | `alltime_cap` | 33554432 | the all-time rung halves when its total passes this many tokens |
@@ -142,7 +144,13 @@ unpacking the state. The state is in `core` (the store, learner, optimisers, mix
 A `.meta.json` sidecar carries the config and the source cursor (path, file position, size). A continuation on the same
 file resumes at the exact byte.
 
-**Compatibility:** 1.0.0 opens checkpoints from 0.1.0–0.1.5 and 1.0.0.
+**Compatibility:** 1.0.1 opens checkpoints from 0.1.0–0.1.5, 1.0.0 and 1.0.1. A checkpoint without `final_norm` in its
+config opens with it off, and is unchanged.
+
+**1.0.1.** Without the final LayerNorm the learner's residual stream is unnormalised. On a fresh model, Adam's first
+steps on the zero-initialised block outputs push it to norms in the thousands, with the learner's own loss in the
+hundreds of nats. At 2048×3 that is a transient over the first ~50 ticks; at 4096×4 it diverged, and io2's
+plasticity exponent overflowed. 1.0.1 adds the norm for new models and clamps io2's exponent.
 
 ## 10. Reporting
 

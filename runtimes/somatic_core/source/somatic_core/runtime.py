@@ -44,7 +44,7 @@ except ImportError:                                                     # as scr
 
 SPECIES = "somatic_core"
 RUNTIME_ID = "soma.somatic_core"
-RUNTIME_VERSION = "1.0.0"
+RUNTIME_VERSION = "1.0.1"
 CHECKPOINT_FORMAT = "somatic-core-pytorch"
 CHECKPOINT_VERSION = 1
 EPS = 1e-12
@@ -183,7 +183,7 @@ class EvaluationMetrics:
 
 
 IDENTITY = ("kmax", "k1", "p2", "k2", "p3", "k3", "np1", "np2", "np3", "ladder", "window", "emb", "hidden", "depth",
-            "proj", "minl", "ring", "ctx_decay", "alltime_cap", "seed")
+            "final_norm", "proj", "minl", "ring", "ctx_decay", "alltime_cap", "seed")
 
 
 @dataclass
@@ -203,6 +203,7 @@ class CoreConfig:
     emb: int = 64
     hidden: int = 2048
     depth: int = 3
+    final_norm: int = 1            # a LayerNorm before the learner's output (1.0.1); older checkpoints load with 0
     proj: int = 16
     minl: int = 3
     ring: int = 65536
@@ -225,7 +226,7 @@ class CoreConfig:
     def validate(self):
         assert 1 <= self.kmax <= 3, "orders 1-3"
         assert self.chunk >= 1 and self.window >= 1 and self.window <= 64
-        assert self.hidden >= 16 and self.depth >= 1
+        assert self.hidden >= 16 and self.depth >= 1 and self.final_norm in (0, 1)
         assert self.learn_stride >= 1 and self.learn_mode in ("skip", "accumulate", "select", "io2")
         assert self.tf32 in (0, 1) and self.learner_bf16 in (0, 1)
         return self
@@ -744,7 +745,7 @@ class SOMA:
             raise ValueError("unsupported somatic_core checkpoint")
         if pointer.get("state") == "complete" and pointer.get("revision_id") != ck.get("revision_id"):
             raise ValueError("checkpoint revision pointer does not match")
-        model = cls(CoreConfig(**ck["config"]), device=device, seed=ck.get("seed", 7),
+        model = cls(CoreConfig(**{"final_norm": 0, **ck["config"]}), device=device, seed=ck.get("seed", 7),
                     description=ck.get("description", ""))
         if model.tokenizer.sha256 != ck.get("tokenizer_sha256"):
             raise ValueError("checkpoint tokenizer differs from runtime tokenizer")
