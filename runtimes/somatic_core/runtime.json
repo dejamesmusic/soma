@@ -1,0 +1,328 @@
+{
+  "protocolVersion": 1,
+  "id": "soma.somatic_core",
+  "version": "1.0.0",
+  "name": "somatic core",
+  "description": "bounded continual learner: exact context store on a phi ladder of timescales (orders 1-3, 4 tokens to all-time) read by a learned network, mixed per context \u00b7 8k alphabet \u00b7 io2 \u00b7 nothing grows \u00b7 no attention, no window",
+  "python": "/Library/Frameworks/Python.framework/Versions/3.11/bin/python3",
+  "sourceRoot": "source",
+  "worker": "somatic_core/somatic_train_worker.py",
+  "chatEntry": "somatic_core.runtime:SOMA",
+  "runtimeModule": "somatic_core/runtime.py",
+  "dependencies": "source/requirements.txt",
+  "capabilities": [
+    "train",
+    "chat",
+    "evaluate",
+    "fork",
+    "stream"
+  ],
+  "checkpoint": {
+    "format": "somatic-core-pytorch",
+    "compatibility": "exact-runtime",
+    "opens": [
+      "0.1.0",
+      "0.1.1",
+      "0.1.2",
+      "0.1.3",
+      "0.1.4",
+      "0.1.5",
+      "1.0.0"
+    ],
+    "cursorPolicy": "resume-saved",
+    "lineage": true
+  },
+  "reporting": {
+    "headline": {
+      "key": "bpb",
+      "label": "bits per byte (prequential)"
+    },
+    "stats": [
+      {
+        "key": "bps",
+        "label": "source bytes/s"
+      },
+      {
+        "key": "life_bytes",
+        "label": "source bytes"
+      },
+      {
+        "key": "bpb_exact",
+        "label": "store alone"
+      },
+      {
+        "key": "bpb_learner",
+        "label": "learner alone"
+      },
+      {
+        "key": "lr",
+        "label": "io2 learning rate"
+      },
+      {
+        "key": "radial_pressure",
+        "label": "radial pressure"
+      },
+      {
+        "key": "o3_pair_fill",
+        "label": "order-3 pairs used"
+      }
+    ]
+  },
+  "fields": [
+    {
+      "key": "corpus",
+      "label": "corpus",
+      "type": "file",
+      "value": "",
+      "group": "feed"
+    },
+    {
+      "key": "save_path",
+      "label": "checkpoint path",
+      "type": "text",
+      "value": "",
+      "group": "output"
+    },
+    {
+      "key": "checkpoint",
+      "label": "continue from",
+      "type": "file",
+      "value": "",
+      "group": "output"
+    },
+    {
+      "key": "fork",
+      "label": "fork checkpoint",
+      "type": "boolean",
+      "value": "false",
+      "options": [
+        "false",
+        "true"
+      ],
+      "group": "output"
+    },
+    {
+      "key": "hidden",
+      "label": "learner width",
+      "type": "integer",
+      "value": "2048",
+      "options": [
+        "512",
+        "1024",
+        "2048",
+        "3072",
+        "4096"
+      ],
+      "group": "shape"
+    },
+    {
+      "key": "depth",
+      "label": "learner depth",
+      "type": "integer",
+      "value": "3",
+      "options": [
+        "1",
+        "2",
+        "3",
+        "4",
+        "6",
+        "8",
+        "12"
+      ],
+      "group": "shape"
+    },
+    {
+      "key": "np3",
+      "label": "order-3 pairs",
+      "type": "integer",
+      "value": "8388608",
+      "options": [
+        "1048576",
+        "4194304",
+        "8388608",
+        "16777216"
+      ],
+      "group": "shape"
+    },
+    {
+      "key": "p2",
+      "label": "order-2 contexts",
+      "type": "integer",
+      "value": "1048576",
+      "options": [
+        "262144",
+        "524288",
+        "1048576",
+        "2097152"
+      ],
+      "group": "shape"
+    },
+    {
+      "key": "p3",
+      "label": "order-3 contexts",
+      "type": "integer",
+      "value": "2097152",
+      "options": [
+        "524288",
+        "1048576",
+        "2097152",
+        "4194304"
+      ],
+      "group": "shape"
+    },
+    {
+      "key": "np1",
+      "label": "order-1 pairs",
+      "type": "integer",
+      "value": "1048576",
+      "options": [
+        "524288",
+        "1048576",
+        "2097152"
+      ],
+      "group": "shape"
+    },
+    {
+      "key": "np2",
+      "label": "order-2 pairs",
+      "type": "integer",
+      "value": "4194304",
+      "options": [
+        "2097152",
+        "4194304",
+        "8388608",
+        "16777216"
+      ],
+      "group": "shape"
+    },
+    {
+      "key": "alltime_cap",
+      "label": "all-time rung halves at (tokens)",
+      "type": "integer",
+      "value": "33554432",
+      "options": [
+        "8388608",
+        "33554432",
+        "134217728",
+        "536870912"
+      ],
+      "group": "shape"
+    },
+    {
+      "key": "chunk",
+      "label": "tick (tokens)",
+      "type": "integer",
+      "value": "512",
+      "options": [
+        "128",
+        "256",
+        "512",
+        "1024"
+      ],
+      "group": "dynamics"
+    },
+    {
+      "key": "lr_base",
+      "label": "io2 base learning rate",
+      "type": "number",
+      "value": "0.003",
+      "group": "dynamics"
+    },
+    {
+      "key": "learn_stride",
+      "label": "learner stride (skip / accumulate / select)",
+      "type": "integer",
+      "value": "1",
+      "options": [
+        "1",
+        "2",
+        "4"
+      ],
+      "group": "dynamics"
+    },
+    {
+      "key": "learn_mode",
+      "label": "learner decimation",
+      "type": "text",
+      "value": "skip",
+      "options": [
+        "skip",
+        "accumulate",
+        "select",
+        "io2"
+      ],
+      "group": "dynamics"
+    },
+    {
+      "key": "tf32",
+      "label": "cuda: tf32 matmuls",
+      "type": "integer",
+      "value": "1",
+      "options": [
+        "1",
+        "0"
+      ],
+      "group": "dynamics"
+    },
+    {
+      "key": "learner_bf16",
+      "label": "cuda: learner in bf16",
+      "type": "integer",
+      "value": "0",
+      "options": [
+        "0",
+        "1"
+      ],
+      "group": "dynamics"
+    },
+    {
+      "key": "epochs",
+      "label": "passes",
+      "type": "integer",
+      "value": "1",
+      "group": "feed"
+    },
+    {
+      "key": "max_bytes",
+      "label": "max source bytes",
+      "type": "integer",
+      "value": "0",
+      "group": "feed"
+    },
+    {
+      "key": "start_byte",
+      "label": "source byte",
+      "type": "integer",
+      "value": "0",
+      "group": "feed"
+    },
+    {
+      "key": "report_every",
+      "label": "report every (segments)",
+      "type": "integer",
+      "value": "4",
+      "group": "reporting"
+    },
+    {
+      "key": "dream_every_batches",
+      "label": "dream every segments",
+      "type": "integer",
+      "value": "200",
+      "group": "reporting"
+    },
+    {
+      "key": "dream_length",
+      "label": "dream length",
+      "type": "integer",
+      "value": "160",
+      "group": "reporting"
+    },
+    {
+      "key": "autosave_min",
+      "label": "autosave minutes",
+      "type": "integer",
+      "value": "30",
+      "group": "reporting"
+    }
+  ]
+}

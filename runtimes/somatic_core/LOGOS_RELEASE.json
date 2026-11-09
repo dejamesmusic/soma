@@ -1,0 +1,12 @@
+{
+ "runtime_id": "soma.somatic_core",
+ "version": "1.0.0",
+ "released": "2026-11-09",
+ "files": [
+  {
+   "name": "soma-somatic-core-1.0.0.tar.gz",
+   "sha256": "e93b6b632073bf0c15ff6015770c200aa444367486c3845dcdeb759a1e0b0f53"
+  }
+ ],
+ "source": "https://logossoma.com/api/runtimes/soma.somatic_core/releases/1.0.0"
+}
