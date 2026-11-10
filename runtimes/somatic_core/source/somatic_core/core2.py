@@ -218,8 +218,10 @@ class Core2(_Core):
             n = C if ix is None else len(ix)
             Pm = self.net.P                                                              # (V, DP)
             X0 = (sel(f0)[..., None] * (self.r0 @ Pm)[None] + Pm.sum(0) / V
-                  + torch.einsum("ibj,jd->ibd", sel(W0), Pm[y])) / (sel(n0i) + 1.0)[..., None]   # (n, NB, DP)
-            Xs = [torch.einsum("ibt,itd->ibd", sel(vals[k]), Pm[sel(toks[k])]) for k in range(K)]
+                  + torch.einsum("ibj,jd->ibd", sel(W0), Pm.index_select(0, y))) / (sel(n0i) + 1.0)[..., None]   # (n, NB, DP)
+            # index_select, not Pm[...]: same maths, but its backward is an index_add, not a sort (half of CUDA time, Nov 9)
+            Xs = [torch.einsum("ibt,itd->ibd", sel(vals[k]), Pm.index_select(0, sel(toks[k]).reshape(-1)).reshape(*sel(toks[k]).shape, Pm.shape[1]))
+                  for k in range(K)]
             fs = [torch.cat([X0, torch.log1p(sel(n0i))[..., None]], -1)]
             for L in range(1, K + 1):
                 run = torch.ones(n, NB, device=d)

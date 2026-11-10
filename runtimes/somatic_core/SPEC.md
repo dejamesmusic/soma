@@ -1,4 +1,4 @@
-# somatic core 1.0.1: runtime specification
+# somatic core 1.1.0: runtime specification
 
 *Runtime `soma.somatic_core`, species `somatic_core`, checkpoint format `somatic-core-pytorch` (checkpoint version 1),
 tokenizer soma-8k-v1 (8192 tokens). Theory: `THEORY.md`. Measurements: `RESULTS.md`.*
@@ -55,8 +55,8 @@ A per-position network. It does not mix across positions, and it has no recurren
   log totals.
 
 It has `depth` layers of width `hidden` (after the first two, pre-LayerNorm residual blocks), a final LayerNorm
-(`final_norm`, added in 1.0.1), and an output layer onto 8192 tokens. It is trained on its own loss with AdamW
-(weight decay `wd`), gradient clipping at 1, and soft radial compression of every row (§7). Its output is `p_learned`.
+(`final_norm`, added in 1.0.1), and an output layer onto 8192 tokens. It is trained on its own loss with AdamW:
+decoupled weight decay `wd` on its matrices, gradient clipping at 1 (§7). Its output is `p_learned`.
 
 **The prediction.** p = s · p_exact + (1 − s) · p_learned. The gate s is learned per key (deepest order, match length,
 entropy bucket).
@@ -89,9 +89,15 @@ The production controller, ported from soma v14:
 ## 7. Nothing grows
 
 Every number the learner carries is bounded. The checkpoint is fixed-size for a given shape.
-- **Learned rows:** soft radial compression. Outward growth is scaled by max(0.01, 1/(1 + r⁴)), where r is the row's
-  norm over its ceiling, and the ceiling is max(1, 0.1 √fan_in).
-- **1-d vectors:** the same rule on the whole vector, with an RMS ceiling of 2.
+- **Learner matrices** (`bound_mode` = `wd`, the default from 1.1): AdamW's decoupled weight decay. Each step shrinks a
+  weight by lr·wd and moves it by at most about lr, so each weight settles within about 1/wd of zero (10 at the
+  default). Gradients are clipped at norm 1.
+- **Learner vectors** (biases, LayerNorm gains): no decay; clamped to ±8.
+- **`bound_mode` = `radial`** (1.0.x, and every checkpoint from before 1.1): soft radial compression of every row.
+  Outward growth is scaled by max(0.01, 1/(1 + r⁴)), where r is the row's norm over its ceiling, max(1, 0.1 √fan_in);
+  vectors take the same rule with an RMS ceiling of 2.
+- **`bound_mode` = `sphere`** (experimental): every matrix keeps its starting Frobenius norm and only turns.
+  Angle-capped steps, no optimiser moments.
 - **Gate and mix weights:** clamped to ±8.
 - **Adam's step count:** capped.
 - **Counts:** bounded by decay. The all-time rung halves at `alltime_cap`.
@@ -107,6 +113,7 @@ Every number the learner carries is bounded. The checkpoint is fixed-size for a 
 | `hidden` | 2048 | learner width (the cloud agent's `width` is accepted as an alias) |
 | `depth` | 3 | learner layers |
 | `final_norm` | 1 | a LayerNorm before the output; checkpoints from before 1.0.1 open with 0 |
+| `bound_mode` | wd | how the learner is bounded (§7): `wd`, `radial` or `sphere`; checkpoints from before 1.1 open with `radial` |
 | `p2`, `p3` | 1048576, 2097152 | order-2 and order-3 context pools |
 | `np1`, `np2`, `np3` | 1048576, 4194304, 8388608 | pair pools per order |
 | `alltime_cap` | 33554432 | the all-time rung halves when its total passes this many tokens |
@@ -121,7 +128,7 @@ Every number the learner carries is bounded. The checkpoint is fixed-size for a 
 |---|---|---|
 | `chunk` | 512 | tokens per tick |
 | `lr_base` | 0.003 | io2's base learning rate |
-| `mix_adam`, `gate_lr`, `wd` | 0.003, 0.02, 1e-4 | mix, gate, weight decay |
+| `mix_adam`, `gate_lr`, `wd` | 0.003, 0.02, 0.1 | mix, gate, weight decay (checkpoints from before 1.1 keep 1e-4) |
 | `learn_stride`, `learn_mode` | 1, skip | decimation (§5) |
 | `tf32` | 1 | CUDA only: fp32 matmuls on tensor cores |
 | `learner_bf16` | 0 | CUDA only: the learner in bf16 autocast, with weights and Adam in fp32 |
@@ -144,13 +151,28 @@ unpacking the state. The state is in `core` (the store, learner, optimisers, mix
 A `.meta.json` sidecar carries the config and the source cursor (path, file position, size). A continuation on the same
 file resumes at the exact byte.
 
-**Compatibility:** 1.0.1 opens checkpoints from 0.1.0–0.1.5, 1.0.0 and 1.0.1. A checkpoint without `final_norm` in its
-config opens with it off, and is unchanged.
+**Compatibility:** 1.1.0 opens checkpoints from 0.1.0–0.1.5, 1.0.0, 1.0.1 and 1.1.0. A checkpoint without `final_norm`
+in its config opens with it off; one without `bound_mode` opens with `radial` and keeps its own `wd`. Both are
+unchanged.
 
 **1.0.1.** Without the final LayerNorm the learner's residual stream is unnormalised. On a fresh model, Adam's first
 steps on the zero-initialised block outputs push it to norms in the thousands, with the learner's own loss in the
 hundreds of nats. At 2048×3 that is a transient over the first ~50 ticks; at 4096×4 it diverged, and io2's
 plasticity exponent overflowed. 1.0.1 adds the norm for new models and clamps io2's exponent.
+
+**1.1.0.** A four-arm A/B on the same 20 MB stream (fineweb-edu 10 MB, scifi 5 MB, fineweb-edu 5 MB; 2048×3, fresh,
+prequential) put plain AdamW weight decay ahead of the radial compressor:
+
+| bounding | lifetime bpb | learner alone, first 10 MB |
+|---|---|---|
+| radial (1.0.1) | 1.8035 | 2.260 |
+| wd 1e-2 | 1.7936 | 2.208 |
+| wd 1e-1 (1.1 default) | 1.7928 | 2.206 |
+| sphere SGD | 1.8398 | 2.545 |
+
+wd 1e-1 was also ~8% faster (no per-row norm pass), and the only Adam arm whose weights and residual stream shrank over
+its life. 1.1 also replaces two advanced-index lookups in the learner's features with `index_select`, the same maths
+with a far cheaper backward on CUDA (1.5× faster ticks on an RTX 3090).
 
 ## 10. Reporting
 

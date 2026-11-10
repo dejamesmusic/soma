@@ -96,3 +96,50 @@ def cap_steps_(opt):
                 s.clamp_(max=STEP_CAP)
             elif s > STEP_CAP:
                 st["step"] = STEP_CAP
+
+
+class SphereSGD:
+    """GM's sphere SGD (soma_gm_v1/optim.py), for bound_mode 'sphere': every learned matrix keeps the Frobenius radius it
+    was initialised with; a step moves only its direction (the gradient's tangent part, the rotation capped at max_angle
+    radians), then retracts to the sphere. No moments are kept. Vectors take a plain step and are bounded in norm.
+    The rate is param_groups[0]['lr'] * scale (io2 sets lr = lr_base * ratio; scale = sphere_rate / lr_base), times
+    min(1, 256 / width) ** 0.5 as in GM. Nothing grows: radii are fixed, vectors are capped."""
+
+    def __init__(self, params, lr, scale, width, max_angle=0.05, vector_bound=16.0):
+        self.params = [p for p in params if p.requires_grad]
+        self.param_groups = [{"lr": float(lr), "weight_decay": 0.0}]
+        self.scale = float(scale) * min(1.0, 256.0 / float(width)) ** 0.5
+        self.max_angle, self.vector_bound = float(max_angle), float(vector_bound)
+        self.radii = [float(p.detach().square().sum().sqrt()) if p.ndim >= 2 else 0.0 for p in self.params]
+        self.state = {}
+
+    def zero_grad(self, set_to_none=True):
+        for p in self.params:
+            p.grad = None
+
+    @torch.no_grad()
+    def step(self):
+        rate = self.param_groups[0]["lr"] * self.scale
+        tan = math.tan(self.max_angle)
+        for p, r in zip(self.params, self.radii):
+            g = p.grad
+            if g is None:
+                continue
+            if p.ndim >= 2:
+                u = p / r
+                gt = g - (g * u).sum() * u
+                step = rate * gt.square().sum().sqrt()
+                shrink = (tan * r / step.clamp_min(1e-30)).clamp(max=1.0)
+                p.sub_(gt * (shrink * rate))
+                p.mul_(r / p.square().sum().sqrt().clamp_min(1e-30))
+            else:
+                p.sub_(g, alpha=rate)
+                p.mul_((self.vector_bound / p.square().sum().sqrt().clamp_min(1e-30)).clamp(max=1.0))
+
+    def state_dict(self):
+        return {"kind": "sphere", "lr": self.param_groups[0]["lr"], "radii": list(self.radii)}
+
+    def load_state_dict(self, s):
+        assert s.get("kind") == "sphere", "not a sphere optimiser state"
+        self.param_groups[0]["lr"] = float(s["lr"])
+        self.radii = [float(x) for x in s["radii"]]

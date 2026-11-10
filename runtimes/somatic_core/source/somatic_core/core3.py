@@ -158,8 +158,26 @@ class Core3(Core2):
             with torch.no_grad():                         # start every row inside its radial ceiling (torch's default
                 self.net.emb.weight.normal_(0.0, 0.1)    # embedding rows are ~8x the ceiling and would start frozen)
                 self.net.P.normal_(0.0, 0.1)
-            self.opt = torch.optim.AdamW(self.net.parameters(), lr=float(c["lr"]), weight_decay=float(c.get("wd", 1e-4)),
-                                         fused=self.dev.type in ("mps", "cuda"))
+            # bound_mode (Nov 9 A/B): 'radial' (1.0.x: AdamW wd + clip + radial compression), 'wd' (AdamW with decoupled
+            # weight decay on matrices + clip, no radial), 'sphere' (GM's sphere SGD: fixed radius per matrix, no moments)
+            self.bound_mode = str(c.get("bound_mode", "radial"))
+            if self.bound_mode == "sphere":
+                with torch.no_grad():                     # a zero matrix has no direction: start the block outputs at
+                    for b in self.net.blocks:             # torch's default init (final_norm keeps the scale harmless)
+                        b.down.reset_parameters()
+                lr_base = float(c.get("lr_base", 3e-3))
+                self.opt = bounds.SphereSGD(self.net.parameters(), self.io2.lr() if self.io2 is not None else lr_base,
+                                            float(c.get("sphere_rate", 0.7)) / lr_base, int(c["hidden"]),
+                                            max_angle=float(c.get("max_angle", 0.05)))
+            elif self.bound_mode == "wd":
+                ps = list(self.net.parameters())
+                self._vecs = [p for p in ps if p.ndim < 2]             # no decay on vectors: a hard bound instead
+                self.opt = torch.optim.AdamW([dict(params=[p for p in ps if p.ndim >= 2], weight_decay=float(c.get("wd", 1e-4))),
+                                              dict(params=[p for p in ps if p.ndim < 2], weight_decay=0.0)],
+                                             lr=float(c["lr"]), fused=self.dev.type in ("mps", "cuda"))
+            else:
+                self.opt = torch.optim.AdamW(self.net.parameters(), lr=float(c["lr"]), weight_decay=float(c.get("wd", 1e-4)),
+                                             fused=self.dev.type in ("mps", "cuda"))
             if self.io2 is not None:
                 for g in self.opt.param_groups:
                     g["lr"] = self.io2.lr()
@@ -304,10 +322,18 @@ class Core3(Core2):
             pass
         elif self.bounded:
             params = [p for p in self.net.parameters()]
-            before = bounds.norms_before(params)
-            bounds.clip_(params, 1.0)                                   # torch's clip: 57 ms/tick on MPS, this ~2
-            self.opt.step()
-            bounds.compress_(params, before)
+            if self.bound_mode == "sphere":
+                self.opt.step()                                         # the angle cap is its clip; the sphere its bound
+            elif self.bound_mode == "wd":
+                bounds.clip_(params, 1.0)
+                self.opt.step()
+                with torch.no_grad():
+                    torch._foreach_clamp_min_(self._vecs, -8.0); torch._foreach_clamp_max_(self._vecs, 8.0)
+            else:
+                before = bounds.norms_before(params)
+                bounds.clip_(params, 1.0)                               # torch's clip: 57 ms/tick on MPS, this ~2
+                self.opt.step()
+                bounds.compress_(params, before)
         else:
             self.opt.step()
         if upd and (acc_ or sel_):
@@ -315,7 +341,8 @@ class Core3(Core2):
         if upd and sel_:
             self._sel_mass = 0.0
         if self.chunks % 1024 == 0:
-            bounds.cap_steps_(self.opt)
+            if not isinstance(self.opt, bounds.SphereSGD):
+                bounds.cap_steps_(self.opt)
             bounds.cap_steps_(self.mopt)
         self._t('optimiser + bounds')
         if self.io2 is not None:

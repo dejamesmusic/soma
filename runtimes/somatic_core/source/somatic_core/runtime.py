@@ -44,7 +44,7 @@ except ImportError:                                                     # as scr
 
 SPECIES = "somatic_core"
 RUNTIME_ID = "soma.somatic_core"
-RUNTIME_VERSION = "1.0.1"
+RUNTIME_VERSION = "1.1.0"
 CHECKPOINT_FORMAT = "somatic-core-pytorch"
 CHECKPOINT_VERSION = 1
 EPS = 1e-12
@@ -183,7 +183,7 @@ class EvaluationMetrics:
 
 
 IDENTITY = ("kmax", "k1", "p2", "k2", "p3", "k3", "np1", "np2", "np3", "ladder", "window", "emb", "hidden", "depth",
-            "final_norm", "proj", "minl", "ring", "ctx_decay", "alltime_cap", "seed")
+            "final_norm", "bound_mode", "proj", "minl", "ring", "ctx_decay", "alltime_cap", "seed")
 
 
 @dataclass
@@ -217,11 +217,17 @@ class CoreConfig:
     lr: float = 1e-3
     mix_adam: float = 3e-3
     gate_lr: float = 0.02
-    wd: float = 1e-4
+    wd: float = 0.1                # decoupled, on the learner's matrices (1.1); radial checkpoints keep their own
     learn_stride: int = 1          # learner optimiser steps on one tick in this many (it predicts every token)
     learn_mode: str = "skip"       # skip | accumulate (by tick) | select (every learn_stride-th prediction) | io2 (io2 picks it)
     tf32: int = 1                  # cuda only: fp32 matmuls on tensor cores (TF32); no effect on mps or cpu
     learner_bf16: int = 0          # cuda only: the learner's forward and backward in bf16 autocast (weights and Adam fp32)
+    # how the learner is bounded (1.1): wd = AdamW decoupled weight decay on matrices, vectors clamped to +-8 (default);
+    # radial = 1.0.x (AdamW + the v14 radial compressor; checkpoints from before 1.1 open with it);
+    # sphere = experimental (fixed-radius sphere SGD; lost 0.047 bpb in the Nov 9 A/B). Fixed when a model is created.
+    bound_mode: str = "wd"
+    sphere_rate: float = 0.7
+    max_angle: float = 0.05
 
     def validate(self):
         assert 1 <= self.kmax <= 3, "orders 1-3"
@@ -229,6 +235,7 @@ class CoreConfig:
         assert self.hidden >= 16 and self.depth >= 1 and self.final_norm in (0, 1)
         assert self.learn_stride >= 1 and self.learn_mode in ("skip", "accumulate", "select", "io2")
         assert self.tf32 in (0, 1) and self.learner_bf16 in (0, 1)
+        assert self.bound_mode in ("radial", "wd", "sphere")
         return self
 
     def public_dict(self):
@@ -305,8 +312,9 @@ class SOMA:
             self.core.io2.lr_base = float(config.lr_base)
         for g in self.core.mopt.param_groups:
             g["lr"] = float(config.mix_adam)
-        for g in self.core.opt.param_groups:
-            g["weight_decay"] = float(config.wd)
+        for i, g in enumerate(self.core.opt.param_groups):
+            if not (self.config.bound_mode == "wd" and i > 0):         # wd mode: group 0 is the matrices, 1 the vectors
+                g["weight_decay"] = float(config.wd)
             if self.core.io2 is None:
                 g["lr"] = float(config.lr)
 
@@ -745,7 +753,7 @@ class SOMA:
             raise ValueError("unsupported somatic_core checkpoint")
         if pointer.get("state") == "complete" and pointer.get("revision_id") != ck.get("revision_id"):
             raise ValueError("checkpoint revision pointer does not match")
-        model = cls(CoreConfig(**{"final_norm": 0, **ck["config"]}), device=device, seed=ck.get("seed", 7),
+        model = cls(CoreConfig(**{"final_norm": 0, "bound_mode": "radial", **ck["config"]}), device=device, seed=ck.get("seed", 7),
                     description=ck.get("description", ""))
         if model.tokenizer.sha256 != ck.get("tokenizer_sha256"):
             raise ValueError("checkpoint tokenizer differs from runtime tokenizer")
