@@ -130,59 +130,141 @@ class Matcher:
         return Matcher.from_state(self.state())
 
 
+class IntIndex:
+    """key -> node for non-negative int keys, in two numpy arrays (1.2.1). Open addressing, linear probing, load <= 0.5,
+    deletion by backward shift (no tombstones). Replaces a dict of tuples that held ~300 bytes a node as Python objects
+    (909 MiB at the 768 model's 3.1M pool nodes; this is ~70 MB). Membership is all that matters: same answers."""
+
+    MUL = 0x9E3779B97F4A7C15
+
+    def __init__(self, P: int):
+        self.bits = max(4, int(2 * max(1, P) - 1).bit_length())
+        self.mask = (1 << self.bits) - 1
+        self.keys = np.full(1 << self.bits, -1, np.int64)
+        self.vals = np.zeros(1 << self.bits, np.int32)
+
+    def _home(self, k: int) -> int:
+        return ((k * self.MUL) & 0xFFFFFFFFFFFFFFFF) >> (64 - self.bits)
+
+    def get(self, k: int, default=-1):
+        K, i = self.keys, self._home(k)
+        while True:
+            x = K[i]
+            if x == k:
+                return int(self.vals[i])
+            if x < 0:
+                return default
+            i = (i + 1) & self.mask
+
+    def set(self, k: int, v: int):
+        K, i = self.keys, self._home(k)
+        while K[i] >= 0 and K[i] != k:
+            i = (i + 1) & self.mask
+        K[i] = k
+        self.vals[i] = v
+
+    def delete(self, k: int):
+        K, V, m, i = self.keys, self.vals, self.mask, self._home(k)
+        while K[i] != k:
+            if K[i] < 0:
+                return
+            i = (i + 1) & m
+        j = i
+        while True:                                   # backward shift: pull later entries of the run into the hole
+            j = (j + 1) & m
+            x = K[j]
+            if x < 0:
+                break
+            h = self._home(int(x))
+            if (j > i and (h <= i or h > j)) or (j < i and (h <= i and h > j)):
+                K[i], V[i] = x, V[j]
+                i = j
+        K[i] = -1
+
+    def build(self, keys: np.ndarray, vals: np.ndarray):
+        """bulk insert (a load), vectorised in probe rounds: an entry takes home + r when that slot is still empty."""
+        self.keys.fill(-1)
+        keys = keys.astype(np.int64); vals = vals.astype(np.int32)
+        home = (((keys.astype(np.uint64) * np.uint64(self.MUL)) >> np.uint64(64 - self.bits))).astype(np.int64)
+        todo = np.arange(len(keys)); r = 0
+        while len(todo):
+            pos = (home[todo] + r) & self.mask
+            free = self.keys[pos] < 0
+            cand, cpos = todo[free], pos[free]
+            _, first = np.unique(cpos, return_index=True)
+            put, ppos = cand[first], cpos[first]
+            self.keys[ppos] = keys[put]; self.vals[ppos] = vals[put]
+            done = np.zeros(len(keys), bool); done[put] = True
+            todo = todo[~done[todo]]
+            r += 1
+
+
+def _key(t) -> int:
+    """a context tuple of tokens (< 2^16 each) as one int"""
+    k = 0
+    for i, x in enumerate(t):
+        k |= int(x) << (16 * i)
+    return k
+
+
 class Pool:
-    """P nodes for the exact k-token contexts of one order; LFU-of-8-sampled eviction (ctxbank.allocate, online)."""
+    """P nodes for the exact k-token contexts of one order; LFU-of-8-sampled eviction (ctxbank.allocate, online).
+    1.2.1: the index, scores and times are numpy (IntIndex, float64, int64), not Python objects; same arithmetic."""
 
     def __init__(self, k: int, P: int, gamma: float, seed: int):
         self.k, self.P = int(k), int(P)
         self.lg = math.log(gamma)
-        self.map: dict = {}
+        self.map = IntIndex(self.P)
         self.keys = np.full((self.P, self.k), -1, np.int32)
-        self.score = [0.0] * self.P
-        self.last = [0] * self.P
+        self.score = np.zeros(self.P, np.float64)
+        self.last = np.zeros(self.P, np.int64)
         self.nxt = 0
         self.rng = np.random.default_rng(seed)
         self.recycles = 0
 
     def lookup(self, key) -> int:
-        return self.map.get(key, -1)
+        return self.map.get(_key(key), -1)
 
     def touch(self, key, t: int):
         """the node for `key` at token time t, allocating (and possibly evicting) on a first sight. -> (node, evicted)"""
-        n = self.map.get(key)
+        kk = _key(key)
+        n = self.map.get(kk, None)
         evicted = False
+        sc, la = self.score, self.last
         if n is None:
             if self.nxt < self.P:
                 n = self.nxt
                 self.nxt += 1
             else:
-                sc, la, lg = self.score, self.last, self.lg
+                lg = self.lg
                 cand = self.rng.integers(0, self.P, size=8)
-                n = int(min(cand, key=lambda c: sc[c] * math.exp(lg * (t - la[c]))))
-                del self.map[tuple(self.keys[n].tolist())]
+                n = int(min(cand, key=lambda c: float(sc[c]) * math.exp(lg * (t - int(la[c])))))
+                self.map.delete(_key(self.keys[n].tolist()))
                 evicted = True
                 self.recycles += 1
-            self.map[key] = n
+            self.map.set(kk, n)
             self.keys[n] = key
-            self.score[n] = 0.0
-            self.last[n] = t
-        self.score[n] = self.score[n] * math.exp(self.lg * (t - self.last[n])) + 1.0
-        self.last[n] = t
+            sc[n] = 0.0
+            la[n] = t
+        sc[n] = float(sc[n]) * math.exp(self.lg * (t - int(la[n]))) + 1.0
+        la[n] = t
         return n, evicted
 
     def state(self) -> dict:
-        return dict(k=self.k, P=self.P, lg=self.lg, keys=self.keys.copy(), score=np.array(self.score, np.float64),
-                    last=np.array(self.last, np.int64), nxt=self.nxt, rng=self.rng.bit_generator.state,
-                    recycles=self.recycles)
+        return dict(k=self.k, P=self.P, lg=self.lg, keys=self.keys.copy(), score=self.score.copy(),
+                    last=self.last.copy(), nxt=self.nxt, rng=self.rng.bit_generator.state, recycles=self.recycles)
 
     def load(self, s: dict):
         self.keys = np.asarray(s["keys"], np.int32).copy()
-        self.score = np.asarray(s["score"], np.float64).tolist()
-        self.last = np.asarray(s["last"], np.int64).tolist()
+        self.score = np.asarray(s["score"], np.float64).copy()
+        self.last = np.asarray(s["last"], np.int64).copy()
         self.nxt, self.recycles = int(s["nxt"]), int(s["recycles"])
         self.rng.bit_generator.state = s["rng"]
         used = np.nonzero(self.keys[:, 0] >= 0)[0]
-        self.map = {tuple(self.keys[n].tolist()): int(n) for n in used}
+        kk = np.zeros(len(used), np.int64)
+        for i in range(self.k):
+            kk |= self.keys[used, i].astype(np.int64) << (16 * i)
+        self.map.build(kk, used)
 
 
 class Slots:
@@ -259,7 +341,7 @@ class Learner(torch.nn.Module):
 DEFAULTS = dict(
     # identity (fixed at creation)
     kmax=3, k1=256, p2=262144, k2=32, p3=524288, k3=16, p4=524288, k4=16,
-    ladder="3,7,11,15,19,23", window=16, emb=64, hidden=1024, proj=16, minl=3, ring=65536, ctx_decay=0.99999,
+    ladder="3,7,11,15,19,23", timescales="", skips="", skip_size=3, window=16, emb=64, hidden=1024, proj=16, minl=3, ring=65536, ctx_decay=0.99999,
     alltime_cap=8388608, seed=0,
     # dynamics (may change on a continuation)
     chunk=16, lr=1e-3, mix_lr=0.002, gate_lr=0.02,
@@ -283,17 +365,34 @@ class Core:
         torch.manual_seed(int(c["seed"]))
         self.KMAX = int(c["kmax"])
         assert 1 <= self.KMAX <= 4
-        self.O = self.KMAX + 1
+        # dev (Nov 11; James: "a less strict match may actually help the present with less exact context"): skip
+        # contexts, exact keys over non-adjacent tokens ("3.2" = the tokens 3 and 2 back, skipping the last). They are
+        # extra orders after the chain: counted and read like any order, fed to the learner, outside the back-off chain
+        # and the exact mix. Empty: unchanged.
+        sk = str(c.get("skips", "") or "")
+        self.skips = [tuple(int(o) for o in g.split(".")) for g in sk.split(";")] if sk else []
+        self.KCH = self.KMAX
+        self.O = self.KMAX + 1 + len(self.skips)
         self.lad = tuple(int(v) for v in str(c["ladder"]).split(","))
-        self.NB = len(self.lad) + 1
+        # dev (Nov 10; James: "phi is an inherited belief. worth putting it up to the light"): explicit timescales in
+        # tokens override the phi ladder; rung b then decays by 1/tau_b per token. Empty: the phi ladder, unchanged.
+        ts = str(c.get("timescales", "") or "")
+        self.taus = tuple(float(v) for v in ts.split(",")) if ts else tuple(PHI ** e for e in self.lad)
+        self.NB = len(self.taus) + 1
         self.PK = {1: V, 2: int(c["p2"]), 3: int(c["p3"]), 4: int(c["p4"])}
         self.KK = {1: int(c["k1"]), 2: int(c["k2"]), 3: int(c["k3"]), 4: int(c["k4"])}
-        self.orders = list(range(1, self.KMAX + 1))
-        self.pools = {k: Pool(k, self.PK[k], float(c["ctx_decay"]), k) for k in self.orders if k >= 2}
+        self.orders = list(range(1, self.KMAX + 1 + len(self.skips)))
+        self.skip_offs = {self.KMAX + 1 + j: offs for j, offs in enumerate(self.skips)}
+        self.skip_like = int(c.get("skip_size", 3) or 3)        # skip orders are sized like this order (3; 2 is cheaper)
+        for k in self.skip_offs:
+            self.PK[k], self.KK[k] = int(c[f"p{self.skip_like}"]), int(c[f"k{self.skip_like}"])
+        self.pools = {k: Pool(len(self.skip_offs.get(k, range(k))), self.PK[k], float(c["ctx_decay"]), k)   # key width
+                      for k in self.orders if k >= 2}
         dense = getattr(self, "_dense_slots", True)            # core3 keeps slot counts in a pair pool instead
         self.slots = {k: Slots(self.PK[k], self.KK[k]) for k in self.orders} if dense else {}
         d, NB = self.dev, self.NB
-        self.ab = torch.tensor([PHI ** -e for e in self.lad] + [0.0], device=d)
+        self.ab = torch.tensor([PHI ** -e for e in self.lad] + [0.0], device=d) if not ts else \
+            torch.tensor([1.0 / t for t in self.taus] + [0.0], device=d)
         self.ar = torch.arange(NB, device=d)
         self.r0 = torch.zeros(NB, V, device=d)
         self.n0 = torch.zeros(NB, device=d)
@@ -331,24 +430,40 @@ class Core:
             g["lr"] = float(self.c["lr"])
 
     # ---- the CPU pass of one chunk ----
-    def _contexts(self, m: Matcher, ys, learn: bool):
+    def _contexts(self, m, ys, learn: bool):
         """node ids per order and position, match predictions and windows, advancing the context's history.
-        ys may be None (a single read of the next position, nothing pushed)."""
+        ys may be None (a single read of the next position, nothing pushed).
+        m may be a list of B Matchers (lanes, a dev feature, Nov 10): the chunk is then B equal blocks, block j from
+        lane j's stream with lane j's own history. The store and learner see the blocks in order, as one stream."""
         C = 1 if ys is None else len(ys)
+        lanes = list(m) if isinstance(m, (list, tuple)) else [m]
+        assert C % len(lanes) == 0, "a laned chunk is B equal blocks"
+        Lc = C // len(lanes)
         W = int(self.c["window"])
-        ids = np.full((self.KMAX, C), -1, np.int64)
+        ids = np.full((len(self.orders), C), -1, np.int64)
         rec = {k: [] for k in self.orders}
         mp = np.full(C, -1, np.int64)
         mb = np.zeros(C, np.int64)
         win = np.zeros((C, W), np.int64)
         for i in range(C):
+            m = lanes[i // Lc]
             tail = m.tail
             n_hist = m.t
             win[i] = m.window(W)
             if n_hist >= 1:
                 ids[0, i] = tail[-1]
             for k in self.orders[1:]:
-                if n_hist >= k:
+                offs = self.skip_offs.get(k)
+                if offs is not None and n_hist >= max(offs):
+                    key = tuple(tail[-o] for o in offs)
+                    if learn:
+                        n, ev = self.pools[k].touch(key, self.clock + i)
+                        if ev:
+                            rec[k].append((i, n))
+                    else:
+                        n = self.pools[k].lookup(key)
+                    ids[k - 1, i] = n
+                elif offs is None and n_hist >= k:
                     key = tuple(tail[-k:])
                     if learn:
                         n, ev = self.pools[k].touch(key, self.clock + i)
@@ -447,8 +562,21 @@ class Core:
             key = (deep * LB + mbt) * NE + torch.bucketize(ent, self.edges)
         return lch, lpE, lpL, key, deep
 
+    transfers = "queued"                                  # cuda only: "queued", "pinned" or "blocking" (diagnostics)
+
+    def _dv(self, a):
+        """a host array on the device. On CUDA the copy is queued behind the GPU's work instead of waiting for it: a
+        blocking copy (`.to(dev)`, `torch.tensor(..., device=dev)`, or a Python scalar assigned through an index) drains
+        the whole queue first, and the tick had 48 of them, so the CPU never ran ahead of the GPU (Nov 10)."""
+        t = torch.from_numpy(a) if isinstance(a, np.ndarray) else a
+        if self.dev.type != "cuda" or self.transfers == "blocking":
+            return t.to(self.dev)
+        if self.transfers == "pinned" and t.numel():
+            t = t.pin_memory()
+        return t.to(self.dev, non_blocking=True)
+
     def _idt(self, ids):
-        return {k: torch.from_numpy(np.where(ids[k - 1] < 0, self.PK[k], ids[k - 1])).to(self.dev) for k in self.orders}
+        return {k: self._dv(np.where(ids[k - 1] < 0, self.PK[k], ids[k - 1])) for k in self.orders}
 
     # ---- one chunk ----
     def step(self, m: Matcher, ys, learn: bool = True):
@@ -589,7 +717,7 @@ class Core:
                    gate_exact=float(torch.sigmoid(self.theta).mean()))
         for k in self.orders:
             S = self.slots[k]
-            used = (self.pools[k].nxt if k >= 2 else int((S.tok[:, 0] >= 0).sum()))
+            used = (self.pools[k].nxt if k >= 2 else (int((S.tok[:, 0] >= 0).sum()) if hasattr(S, "tok") else int((S.ptok[np.where(S.ptab[:, 0] >= 0, S.ptab[:, 0], S.NPAGE), 0] >= 0).sum())))
             out[f"o{k}_nodes"] = used
             out[f"o{k}_fill"] = used / self.PK[k]
             out[f"o{k}_overflows"] = S.overflows

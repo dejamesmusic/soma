@@ -44,7 +44,7 @@ except ImportError:                                                     # as scr
 
 SPECIES = "somatic_core"
 RUNTIME_ID = "soma.somatic_core"
-RUNTIME_VERSION = "1.1.0"
+RUNTIME_VERSION = "1.2.1"
 CHECKPOINT_FORMAT = "somatic-core-pytorch"
 CHECKPOINT_VERSION = 1
 EPS = 1e-12
@@ -148,17 +148,18 @@ def _tensor_bytes(value, seen=None) -> int:
     return 0
 
 
-def pack(x):
-    """numpy-free form of a state (numpy arrays become uint8 tensors with dtype and shape), for weights_only loads."""
+def pack(x, copy=True):
+    """numpy-free form of a state (numpy arrays become uint8 tensors with dtype and shape), for weights_only loads.
+    copy=False shares the arrays' memory (1.2.1: a save that writes at once needs no second copy of the store)."""
     if isinstance(x, np.ndarray):
-        return {"__np__": x.dtype.str, "shape": list(x.shape),
-                "data": torch.from_numpy(np.ascontiguousarray(x).view(np.uint8).reshape(-1).copy())}
+        flat = np.ascontiguousarray(x).view(np.uint8).reshape(-1)
+        return {"__np__": x.dtype.str, "shape": list(x.shape), "data": torch.from_numpy(flat.copy() if copy else flat)}
     if isinstance(x, np.generic):
         return x.item()
     if isinstance(x, dict):
-        return {k: pack(v) for k, v in x.items()}
+        return {k: pack(v, copy) for k, v in x.items()}
     if isinstance(x, (list, tuple)):
-        return type(x)(pack(v) for v in x)
+        return type(x)(pack(v, copy) for v in x)
     return x
 
 
@@ -182,29 +183,47 @@ class EvaluationMetrics:
     tokens: int
 
 
+LEGACY_DEFAULTS = dict(att_past=0, learner="mlp", att_heads=6, att_ctx=1024, att_inject="input", warmup=0, skips="", skip_size=3,
+                       timescales="", k1=256, k2=32, k3=16, np2=4194304, np3=8388608, hidden=2048, depth=3, proj=16,
+                       ladder="3,7,11,15,19,23", io2=1, lr=1e-3, wd=0.1, slot_page=0)
+
 IDENTITY = ("kmax", "k1", "p2", "k2", "p3", "k3", "np1", "np2", "np3", "ladder", "window", "emb", "hidden", "depth",
-            "final_norm", "bound_mode", "proj", "minl", "ring", "ctx_decay", "alltime_cap", "seed")
+            "final_norm", "bound_mode", "proj", "minl", "ring", "ctx_decay", "alltime_cap", "seed",
+            "learner", "att_heads", "att_ctx", "att_inject", "att_past", "skips", "skip_size", "timescales", "slot_page")
 
 
 @dataclass
 class CoreConfig:
+    # Nov 11 (James: "adopt the attention learner and commit to closing the gap"): the defaults are the adopted somatic
+    # core, the best tested settings: attention learner 768x12 fed the store at every block, ctx 1024, lr 2e-4 fixed,
+    # store at slots x8, pair pools x2, ladder phi^5..phi^25, proj 256, wd 0.002, paged slots. Locked as 1.2.0 (Nov 16).
+    # Checkpoints from before carry their own config; fields they lack take LEGACY_DEFAULTS (the 1.1 learner).
     # identity (fixed at creation)
     kmax: int = 3
-    k1: int = 256
+    k1: int = 2048
     p2: int = 1048576
-    k2: int = 32
+    k2: int = 256
     p3: int = 2097152
-    k3: int = 16
+    k3: int = 128
     np1: int = 1048576
-    np2: int = 4194304
-    np3: int = 8388608
-    ladder: str = "3,7,11,15,19,23"
+    np2: int = 8388608
+    np3: int = 16777216
+    ladder: str = "5,9,13,17,21,25"
+    timescales: str = ""            # dev: explicit rung timescales in tokens, overriding the phi ladder
+    learner: str = "attn"           # dev: "attn" = a causal transformer over the last att_ctx tokens (hidden = width, depth = layers)
+    att_heads: int = 12
+    att_ctx: int = 1024
+    skips: str = ""                 # dev: skip contexts, e.g. "3.2;3.1" (offsets back); extra orders fed to the learner
+    skip_size: int = 3              # dev: skip orders' slots and pair pools are sized like this order (2 or 3)
+    att_inject: str = "every"       # dev: where the store enters the attention learner ("input" | "every")
+    att_past: int = 0               # dev: the window's earlier positions carry their own store reads (Learner3 past=1)
+    warmup: int = 200                 # dev: learner steps over which its rate ramps up (0: none)
     window: int = 16
     emb: int = 64
-    hidden: int = 2048
-    depth: int = 3
+    hidden: int = 768
+    depth: int = 12
     final_norm: int = 1            # a LayerNorm before the learner's output (1.0.1); older checkpoints load with 0
-    proj: int = 16
+    proj: int = 256
     minl: int = 3
     ring: int = 65536
     ctx_decay: float = 0.99999
@@ -212,16 +231,37 @@ class CoreConfig:
     seed: int = 0
     # dynamics (may change on a continuation)
     chunk: int = 512
-    io2: int = 1
+    io2: int = 0
     lr_base: float = 3e-3
-    lr: float = 1e-3
+    lr: float = 2e-4
+    rate_ctl: str = "fixed"        # dev (Nov 13): "fixed" | "agree" (the rate follows gradient agreement; core3._agree)
+    ctl_signal: str = "adam"       # dev: agree's signal: "adam" (v1, failed Nov 14) | "total" (v2, failed Nov 14) | "lag" (v3: against the displacement over ctl_lag..2*ctl_lag steps)
+    ctl_lag: int = 64              # dev: agree "lag": steps between the snapshots its displacement is measured from
+    ctl_drift: float = 0.0         # dev: agree "lag" v4: if > 0, lag = ctl_drift / lr steps (the learner's own timescale)
+    ctl_lag_min: int = 8
+    ctl_lag_max: int = 4096
+    ctl_sub: int = 1               # dev: agree "lag": judge on every ctl_sub-th coordinate (snapshot memory / ctl_sub)
+    feat_scatter: int = 1          # store read: scatter counts onto the vocabulary when cheaper than a per-slot gather (Nov 15)
+    slot_page: int = 16            # store: 0 dense slot rows; R > 0 pages of R slots from a shared pool (Nov 15, same answers, ~6x smaller)
+    att_ckpt: int = -1              # memory: recompute attention blocks in backward (same math; the 768 learner on an 8 GB Mac); -1 auto = on for mps
+    att_kernel: int = -1            # 1.2.1: attention by the Metal flash kernel (flash_mps.py; same maths up to float order); -1 auto = on for mps
+    hg_tier: int = 1               # dev: rate_ctl=hyper (Nov 15): 0 one-step hypergradient; 1 trace with diagonal Fisher curvature
+    hg_mu: float = 0.01            # dev: hyper: e-folds of rate per tick at a unit normalised hypergradient
+    hg_curv: float = 0.0           # dev: hyper tier 1: tokens N in curvature ~ N v_hat (0 = the tick)
+    hg_rms: float = 0.99           # dev: hyper: decay of the hypergradient's running RMS
+    hg_span: float = 30.0          # dev: hyper: rail on the rate, lr / span .. lr * span (hits are reported)
+    ctl_k: float = 0.05             # dev: agree's gain: log-rate change per step per unit of agreement (cosine)
+    ctl_min: float = 1e-6
+    ctl_max: float = 1e-2
     mix_adam: float = 3e-3
     gate_lr: float = 0.02
-    wd: float = 0.1                # decoupled, on the learner's matrices (1.1); radial checkpoints keep their own
+    wd: float = 0.002               # decoupled, on the learner's matrices (1.1; 0.002 from the Nov 12 1 GB runs); radial checkpoints keep their own
     learn_stride: int = 1          # learner optimiser steps on one tick in this many (it predicts every token)
     learn_mode: str = "skip"       # skip | accumulate (by tick) | select (every learn_stride-th prediction) | io2 (io2 picks it)
     tf32: int = 1                  # cuda only: fp32 matmuls on tensor cores (TF32); no effect on mps or cpu
     learner_bf16: int = 0          # cuda only: the learner's forward and backward in bf16 autocast (weights and Adam fp32)
+    rehearse: int = 0              # dev (Nov 10): extra learner steps per tick on reads taken before their store update
+    rehearse_span: int = 1         # dev: 1 = repeat the current tick; D > 1 = each extra step on one of the last D ticks
     # how the learner is bounded (1.1): wd = AdamW decoupled weight decay on matrices, vectors clamped to +-8 (default);
     # radial = 1.0.x (AdamW + the v14 radial compressor; checkpoints from before 1.1 open with it);
     # sphere = experimental (fixed-radius sphere SGD; lost 0.047 bpb in the Nov 9 A/B). Fixed when a model is created.
@@ -235,7 +275,10 @@ class CoreConfig:
         assert self.hidden >= 16 and self.depth >= 1 and self.final_norm in (0, 1)
         assert self.learn_stride >= 1 and self.learn_mode in ("skip", "accumulate", "select", "io2")
         assert self.tf32 in (0, 1) and self.learner_bf16 in (0, 1)
+        assert self.rehearse >= 0 and self.rehearse_span >= 1
         assert self.bound_mode in ("radial", "wd", "sphere")
+        assert self.rate_ctl in ("fixed", "agree", "hyper") and not (self.rate_ctl == "agree" and self.io2), "one rate controller"
+        assert self.learner != "attn" or self.att_ctx >= self.chunk, "att_ctx must cover a tick (positions index past it)"
         return self
 
     def public_dict(self):
@@ -308,6 +351,12 @@ class SOMA:
                 setattr(self.config, k, v)
                 self.core.c[k] = v
         _precision(self.device, self.config)
+        if hasattr(self.core.net, "ckpt"):
+            a = int(self.config.att_ckpt)
+            self.core.net.ckpt = bool(a) if a >= 0 else self.device.type == "mps"
+            fk = int(self.config.att_kernel)
+            for b in self.core.net.blocks:
+                b.flash = (bool(fk) if fk >= 0 else self.device.type == "mps") and self.device.type == "mps"
         if self.core.io2 is not None:
             self.core.io2.lr_base = float(config.lr_base)
         for g in self.core.mopt.param_groups:
@@ -510,7 +559,18 @@ class SOMA:
         p = p / p.sum()
         return int(torch.multinomial(p, 1, generator=self.sampler))
 
+    def _chat_window(self):
+        """1.2.0: the attention learner only ever predicts behind a full window (att_ctx tokens; training reads every
+        tick that way), and a short window gives noise. A chat context shorter than that starts as a copy of the stream
+        context (what the model was reading), then a blank line, the corpus's document break. Changes nothing for the
+        mlp learner or a chat that is already long enough."""
+        if self.config.learner != "attn" or self.chat_ctx.t >= int(self.config.att_ctx) or self.stream_ctx.t < 1:
+            return
+        self.chat_ctx = self.stream_ctx.clone()
+        self.core.observe(self.chat_ctx, encode_bytes(self.tokenizer, b"\n\n"))
+
     def ingest_text(self, text, online=False):
+        self._chat_window()
         ids = np.asarray(encode_bytes(self.tokenizer, str(text).encode("utf-8")), np.int64)
         if len(ids):
             if online:
@@ -521,6 +581,7 @@ class SOMA:
 
     def ingest_prompt(self, text, online=False, mark_turn=True):
         """a user turn: [user] text [soma]. Markers are read into the context; the user's words learn when online."""
+        self._chat_window()
         ctl = self.tokenizer.control_ids
         body = np.asarray(encode_bytes(self.tokenizer, str(text).encode("utf-8")), np.int64)
         if mark_turn:
@@ -535,9 +596,12 @@ class SOMA:
 
     @torch.no_grad()
     def next_logits(self) -> torch.Tensor:
+        self._chat_window()
         return torch.log(self.core.next_distribution(self.chat_ctx).clamp_min(1e-30))
 
     def _generation_tokens(self, length, temperature, ctx=None):
+        if ctx is None:
+            self._chat_window()
         ctx = self.chat_ctx if ctx is None else ctx
         forbidden = list(self.tokenizer.generation_forbidden_ids)
         turn = self.tokenizer.control_ids["turn"]
@@ -568,6 +632,8 @@ class SOMA:
 
     def dream_text(self, length=128, temperature=0.8, *, stateful=False, source="chat") -> str:
         """a dream from a copy of a context (changes nothing unless stateful)."""
+        if source != "stream":
+            self._chat_window()
         base = self.stream_ctx if source == "stream" else self.chat_ctx
         ctx = base if stateful else base.clone()
         state = None if stateful else self.sampler.get_state()
@@ -590,6 +656,8 @@ class SOMA:
     @torch.no_grad()
     def evaluate(self, corpus_path, max_bytes=0, start_byte=0, carry_state=True) -> EvaluationMetrics:
         """held-out metrics on a slice, read with nothing learning, on a copy of the chat context (or a fresh one)."""
+        if carry_state:
+            self._chat_window()
         ctx = self.chat_ctx.clone() if carry_state else Matcher(self.config.ring, self.config.minl)
         path = Path(corpus_path).expanduser().resolve()
         size = path.stat().st_size
@@ -633,7 +701,7 @@ class SOMA:
             "root_lineage_id": self.root_lineage_id, "created_at": self.created_at, "revision_history": history[-256:],
             "forked_from_checkpoint_id": self.forked_from_checkpoint_id,
             "forked_from_revision_id": self.forked_from_revision_id, "tokenizer_sha256": self.tokenizer.sha256,
-            "core": pack(self.core.state_dict()), "stream_ctx": pack(self.stream_ctx.state()),
+            "core": pack(self.core.state_dict(lean=True), copy=False), "stream_ctx": pack(self.stream_ctx.state()),
             "chat_ctx": pack(self.chat_ctx.state()), "sampler": self.sampler.get_state(),
             "source_cursor": pack(self._source_cursor), "life": dict(self.life),
             # plain metadata for readers that never unpack the core (logOS's checkpoint parser)
@@ -748,16 +816,19 @@ class SOMA:
         pointer = _read_json(Path(f"{path}.revision.json"))
         if pointer.get("state") == "pending":
             raise ValueError("checkpoint publication is unfinished")
-        ck = torch.load(path, map_location="cpu", weights_only=True)
+        ck = torch.load(path, map_location="cpu", weights_only=True, mmap=True)   # mmap: one copy on an 8 GB Mac
         if ck.get("checkpoint_format") != CHECKPOINT_FORMAT or int(ck.get("checkpoint_version", 0)) != CHECKPOINT_VERSION:
             raise ValueError("unsupported somatic_core checkpoint")
         if pointer.get("state") == "complete" and pointer.get("revision_id") != ck.get("revision_id"):
             raise ValueError("checkpoint revision pointer does not match")
-        model = cls(CoreConfig(**{"final_norm": 0, "bound_mode": "radial", **ck["config"]}), device=device, seed=ck.get("seed", 7),
+        model = cls(CoreConfig(**{"final_norm": 0, "bound_mode": "radial", **LEGACY_DEFAULTS, **ck["config"]}), device=device, seed=ck.get("seed", 7),
                     description=ck.get("description", ""))
         if model.tokenizer.sha256 != ck.get("tokenizer_sha256"):
             raise ValueError("checkpoint tokenizer differs from runtime tokenizer")
-        model.core.load_state_dict(unpack(ck["core"]))
+        core_state = unpack(ck.pop("core"))
+        model.core.load_state_dict(core_state)
+        del core_state
+        gc.collect()
         model.stream_ctx = Matcher.from_state(unpack(ck["stream_ctx"]))
         model.chat_ctx = Matcher.from_state(unpack(ck["chat_ctx"]))
         model.sampler.set_state(ck["sampler"])

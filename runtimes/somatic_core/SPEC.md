@@ -1,11 +1,13 @@
-# somatic core 1.1.0: runtime specification
+# somatic core 1.2.1: runtime specification
 
 *Runtime `soma.somatic_core`, species `somatic_core`, checkpoint format `somatic-core-pytorch` (checkpoint version 1),
 tokenizer soma-8k-v1 (8192 tokens). Theory: `THEORY.md`. Measurements: `RESULTS.md`.*
 
-somatic core predicts the next token of one stream, then learns from it, forever, in a state of fixed size. It has no
-attention and no context window: what it keeps of the past is the exact statistics of what followed what, at a ladder of
-timescales from about 4 tokens to all-time, read by a learned network.
+somatic core predicts the next token of one stream, then learns from it, forever, in a state of fixed size. Its memory
+has no context window: what it keeps of the past is the exact statistics of what followed what, at a ladder of
+timescales from about 11 tokens to all-time. A learned network reads that memory. Since 1.2 the network is a causal
+attention learner over the last 1024 tokens, which reads the store at every block; evidence older than its window
+reaches it only through the store, and fades there along smooth curves, never at an edge.
 
 ## 1. One tick
 
@@ -24,17 +26,18 @@ cadence does.
 | part | what it holds | size |
 |---|---|---|
 | contexts, orders 1–3 | the last 1, 2 and 3 tokens; one node per distinct context. Order 1 has a node per token; orders 2 and 3 are bounded pools (`p2`, `p3`) that recycle the stalest node | `p2`, `p3` nodes |
-| successor slots | per node, up to `k1` / `k2` / `k3` successor tokens | nodes × slots (CPU) |
+| successor slots | per node, up to `k1` / `k2` / `k3` successor tokens; since 1.2 in pages of `slot_page` (16) slots from a shared pool, so a node holds only the pages it uses | pages × 16 (CPU) |
 | pair counts | per (context, successor) pair, a count on each rung of the ladder | `np1`, `np2`, `np3` pairs × 7 rungs (GPU) |
 | node totals, clocks | per node, a total on each rung, and the clock of its last update (decay is lazy, per node) | nodes × 7 |
 | order 0 | per token, a count on each rung | 8192 × 7 |
 | match model | the stream's recent tokens (`ring`), for copying a repeat of length ≥ `minl` | `ring` |
 | learner | the learned reader (§4) and its AdamW state | ≈ 16 bytes per parameter |
+| match index | the order-2/3 context pools' key → node index (numpy open addressing since 1.2.1) | ~70 MB at the defaults |
 | mix, gate | rung weights per deepest order (4 × 7), match weights (4 × 6), a gate per key | small |
-| io2 | the controller's residual bank (§6) | 17 × width, float64 |
+| io2 | the controller's residual bank (§6; legacy models only) | 17 × width, float64 |
 
-**The ladder.** Rung *b* decays each count by 1 − φ^(−e_b) per token, with e = `ladder` = 3, 7, 11, 15, 19, 23. The
-timescales are τ ≈ 4, 29, 199, 1364, 9349 and 64079 tokens. A seventh rung is all-time: it never decays, and it halves
+**The ladder.** Rung *b* decays each count by 1 − φ^(−e_b) per token, with e = `ladder` = 5, 9, 13, 17, 21, 25 (1.2;
+3, 7, … 23 before). The timescales are τ ≈ 11, 76, 521, 3571, 24476 and 167761 tokens. A seventh rung is all-time: it never decays, and it halves
 when its total passes `alltime_cap` tokens.
 
 ## 3. The exact reader
@@ -49,21 +52,30 @@ order present. The match model adds a learned bump on the token it predicts. The
 
 ## 4. The learned reader
 
-A per-position network. It does not mix across positions, and it has no recurrence. Its inputs:
-- the last `window` tokens (16), embedded (`emb`, 64);
-- for every order and rung, the exact reader's chain projected through a learned token projection (`proj`, 16), with
-  log totals.
+**The attention learner** (`learner` = `attn`, the default since 1.2). A causal transformer of `depth` pre-LayerNorm
+blocks, width `hidden`, `att_heads` heads and learned absolute positions, over the last `att_ctx` (1024) tokens. Each
+tick predicts its `chunk` positions at the end of a full window, so every position it is trained on sees `att_ctx`
+tokens behind it.
 
-It has `depth` layers of width `hidden` (after the first two, pre-LayerNorm residual blocks), a final LayerNorm
-(`final_norm`, added in 1.0.1), and an output layer onto 8192 tokens. It is trained on its own loss with AdamW:
-decoupled weight decay `wd` on its matrices, gradient clipping at 1 (§7). Its output is `p_learned`.
+The store enters at every block (`att_inject` = `every`). For each predicted position, the exact reader's chain at every
+order and rung is projected through a learned token projection (`proj`, 256), with log totals; a LayerNorm and a
+linear cell map that read to width `hidden`, and it is added to that position's residual stream before each block.
+A final LayerNorm and an output layer onto 8192 tokens give `p_learned`. It is trained on its own loss with AdamW at a
+fixed rate `lr` (2e-4) after a linear `warmup` of 200 steps; decoupled weight decay `wd` (0.002) on its matrices;
+gradients clipped at 1 (§7).
+
+**The legacy learner** (`learner` = `mlp`, 1.0–1.1, and every checkpoint from before 1.2). A per-position network with no
+mixing across positions and no recurrence. Its inputs are the last `window` tokens (16), embedded (`emb`, 64), and the
+same chain projections (`proj`, 16). It has `depth` layers of width `hidden` (after the first two, pre-LayerNorm
+residual blocks) and a final LayerNorm (`final_norm`, added in 1.0.1).
 
 **The prediction.** p = s · p_exact + (1 − s) · p_learned. The gate s is learned per key (deepest order, match length,
 entropy bucket).
 
 ## 5. Learning per tick
 
-- **The learner:** one AdamW step on the tick's mean loss, at io2's learning rate.
+- **The learner:** one AdamW step on the tick's mean loss, at the fixed rate `lr` (legacy models: io2's rate). Its
+  gradients are freed as soon as the step is taken (1.2.1).
 - **The rung and match weights:** one Adam step (`mix_adam`).
 - **The gate:** a closed-form step toward whichever reader did better (`gate_lr`).
 - **The store:** counts the tick's tokens. A recycled node, and its pairs, read as empty from the tick it is recycled.
@@ -79,7 +91,7 @@ bpb, for 17–21% more throughput. That is why the default is no decimation.
 
 ## 6. io2
 
-The production controller, ported from soma v14:
+Off for new models since 1.2 (`io2` = 0), which learn at a fixed rate. Models from 1.0–1.1 keep it. The controller, ported from soma v14:
 1. The learner's residual, translated into its own coordinates (W_outᵀ(onehot − p) / mean row norm), drives a bank of
    16 φ-spaced bands.
 2. The bank's energy, coherence and spectrum set the plasticity ratio, once per quantum of 512 predictions.
@@ -104,22 +116,46 @@ Every number the learner carries is bounded. The checkpoint is fixed-size for a 
 - **Clocks:** rebased at 2³⁰ tokens.
 - **Pools, slots, pairs and the ring:** fixed size.
 
-## 8. Settings
+## 8. Chat and generation
+
+Chat, dreams and evaluation read with a training tick's geometry, because the attention learner has only ever predicted
+behind a full window.
+- **The window.** A read anchors on the last `att_ctx` − `chunk` + 1 tokens, as a tick's first prediction sees them,
+  and grows by one position per new token until it is full; then it re-anchors.
+- **The cache (1.2.1).** Each block's keys and values for the window are kept, so a generated token costs one position
+  of work, not a full window. The cache lives on the conversation's context and is dropped whenever the weights move.
+  It equals a full forward to float order (6e-6 in logits).
+- **A new chat** starts from the end of the stream the model learned from, plus a blank line, not from an empty window.
+
+## 9. Execution on a Mac (1.2.1)
+
+Two settings, both on by default on Apple silicon (`-1` = auto) and off elsewhere:
+- `att_kernel`: attention by a Metal kernel (FlashAttention-2 style, fp32, head dim 64, causal). It never stores the
+  T × T score matrix; it equals PyTorch's attention to ≤ 2e-6.
+- `att_ckpt`: each attention block is recomputed in the backward pass instead of keeping its activations.
+
+Saves write the store and weights directly, without a second copy (a save's extra memory went from 2.8 GB to 0.5 GB
+at 768). On an 8 GB M-series Mac the 768×12 model trains at about 2.1k bytes/s with a peak near 6 GB, loads in
+3.7 GB, and chats at 19–31 ms per token.
+
+## 10. Settings
 
 **Shape** is fixed when a model is created; a continuation keeps it.
 
 | setting | default (new model) | meaning |
 |---|---|---|
-| `hidden` | 2048 | learner width (the cloud agent's `width` is accepted as an alias) |
-| `depth` | 3 | learner layers |
+| `learner` | attn | `attn` (§4) or the legacy `mlp` |
+| `hidden`, `depth` | 768, 12 | learner width and blocks (the cloud agent's `width` is accepted as an alias) |
+| `att_heads`, `att_ctx`, `att_inject` | 12, 1024, every | the attention learner's heads, window and where the store enters |
 | `final_norm` | 1 | a LayerNorm before the output; checkpoints from before 1.0.1 open with 0 |
 | `bound_mode` | wd | how the learner is bounded (§7): `wd`, `radial` or `sphere`; checkpoints from before 1.1 open with `radial` |
 | `p2`, `p3` | 1048576, 2097152 | order-2 and order-3 context pools |
-| `np1`, `np2`, `np3` | 1048576, 4194304, 8388608 | pair pools per order |
+| `np1`, `np2`, `np3` | 1048576, 8388608, 16777216 | pair pools per order |
+| `k1`, `k2`, `k3` | 2048, 256, 128 | successor slots per node |
+| `slot_page` | 16 | slots per page (0: one dense row per node, as before 1.2) |
 | `alltime_cap` | 33554432 | the all-time rung halves when its total passes this many tokens |
-| `k1`, `k2`, `k3` | 256, 32, 16 | successor slots per node |
-| `ladder` | 3,7,11,15,19,23 | rung exponents, φ^e tokens |
-| `window`, `emb`, `proj` | 16, 64, 16 | learner inputs |
+| `ladder` | 5,9,13,17,21,25 | rung exponents, φ^e tokens |
+| `window`, `emb`, `proj` | 16, 64, 256 | learner inputs (`window` and `emb`: legacy learner only) |
 | `ring`, `minl` | 65536, 3 | match model |
 
 **Dynamics** may change on a continuation.
@@ -127,16 +163,20 @@ Every number the learner carries is bounded. The checkpoint is fixed-size for a 
 | setting | default | meaning |
 |---|---|---|
 | `chunk` | 512 | tokens per tick |
-| `lr_base` | 0.003 | io2's base learning rate |
-| `mix_adam`, `gate_lr`, `wd` | 0.003, 0.02, 0.1 | mix, gate, weight decay (checkpoints from before 1.1 keep 1e-4) |
+| `lr`, `warmup` | 0.0002, 200 | the learner's fixed rate, and the steps over which it ramps up |
+| `io2`, `lr_base` | 0, 0.003 | io2 and its base rate (legacy models) |
+| `mix_adam`, `gate_lr`, `wd` | 0.003, 0.02, 0.002 | mix, gate, weight decay (checkpoints from before 1.1 keep 1e-4) |
+| `att_kernel`, `att_ckpt` | -1, -1 | Metal attention kernel and block recompute (§9); -1 = on for Apple silicon |
 | `learn_stride`, `learn_mode` | 1, skip | decimation (§5) |
 | `tf32` | 1 | CUDA only: fp32 matmuls on tensor cores |
 | `learner_bf16` | 0 | CUDA only: the learner in bf16 autocast, with weights and Adam in fp32 |
 
-**Sizes at the defaults:** 41.5M learner parameters, a ~1.9 GB checkpoint and ~1.1 GB of GPU memory. On an Apple M3,
-about 2.8k tokens/s (11.5k bytes/s).
+Settings marked dev in `runtime.py` (rate controllers, rehearsal, skip contexts) are experiments, not part of the
+release.
 
-## 9. Checkpoint
+**Sizes at the defaults:** 106M learner parameters, a ~3.4 GB checkpoint (0.8 GB of it the store).
+
+## 11. Checkpoint
 
 A `torch.save` dict. Its identity fields:
 - `checkpoint_format`, `checkpoint_version`, `runtime_id`, `runtime_version`, `species`, `tokenizer_sha256`;
@@ -151,9 +191,10 @@ unpacking the state. The state is in `core` (the store, learner, optimisers, mix
 A `.meta.json` sidecar carries the config and the source cursor (path, file position, size). A continuation on the same
 file resumes at the exact byte.
 
-**Compatibility:** 1.1.0 opens checkpoints from 0.1.0–0.1.5, 1.0.0, 1.0.1 and 1.1.0. A checkpoint without `final_norm`
-in its config opens with it off; one without `bound_mode` opens with `radial` and keeps its own `wd`. Both are
-unchanged.
+**Compatibility:** 1.2.1 opens checkpoints from 0.1.0–0.1.5, 1.0.0, 1.0.1, 1.1.0, 1.2.0 and 1.2.1. Settings a
+checkpoint's config lacks take the values its own release used (the legacy learner, io2, dense slots, the old ladder),
+so an older model opens unchanged. A checkpoint without `final_norm` opens with it off; one without `bound_mode` opens
+with `radial` and keeps its own `wd`. A continuation keeps the model's shape even when the request differs.
 
 **1.0.1.** Without the final LayerNorm the learner's residual stream is unnormalised. On a fresh model, Adam's first
 steps on the zero-initialised block outputs push it to norms in the thousands, with the learner's own loss in the
@@ -174,13 +215,23 @@ wd 1e-1 was also ~8% faster (no per-row norm pass), and the only Adam arm whose 
 its life. 1.1 also replaces two advanced-index lookups in the learner's features with `index_select`, the same maths
 with a far cheaper backward on CUDA (1.5× faster ticks on an RTX 3090).
 
-## 10. Reporting
+**1.2.0.** The attention learner is adopted (§4), with the store's slots ×8, pair pools ×2, the ladder at φ^5…φ^25,
+`proj` 256, paged slots and a fixed rate. After one pass over 1 GB of fineweb-edu, a 1024×12 model scored 1.165
+bits per byte on the next 50 MB while still learning, against 1.178 for a 161M-parameter transformer trained offline for
+one epoch on the same 1 GB and then frozen (one seed each). The 768×12 model scored 1.199 on the same 50 MB.
+
+**1.2.1.** The Mac release (§8–9): the chat cache, the Metal attention kernel, block recompute on by default, saves
+without a second copy, and a numpy index for the context pools (909 MiB of Python objects became about 70 MB at 768,
+with identical answers). On an 8 GB Mac, training the 768 model went from 1.44 s to 0.89 s a tick (0.6k to 2.1k
+bytes/s) and its peak from 7.7 GB to 6.1 GB; chat went from about 100 ms to 19–31 ms a token. Same maths throughout.
+
+## 12. Reporting
 
 - **Headline:** `bpb` (prequential, final mix).
 - **Stats:** `bps` (source bytes/s), `life_bytes`, `bpb_exact` (the store alone), `bpb_learner` (the learner alone),
-  `lr`, `radial_pressure`, `o3_pair_fill`.
+  `lr`, `gate_exact`, `o3_pair_fill`.
 - **Also reported:**
-  - `gate_exact`;
+  - `radial_pressure` (legacy models);
   - per-order fill, recycles and overflows;
   - halvings;
   - io2's ratio, energy, coherence and band;

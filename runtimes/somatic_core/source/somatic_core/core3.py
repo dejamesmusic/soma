@@ -18,7 +18,7 @@ import math
 import numpy as np
 import torch
 
-from .core2 import Core2
+from .core2 import Core2, Learner3
 from .core import Matcher
 from . import bounds
 
@@ -41,6 +41,10 @@ class PairSlots:
     def node_pids(self, n: int) -> np.ndarray:
         p = self.pid[n]
         return p[p >= 0]
+
+    def rows(self, nodes: np.ndarray):
+        """-> (tok, pid), each (len(nodes), K): the nodes' successor slots (-1 empty)."""
+        return self.tok[nodes], self.pid[nodes]
 
     def reset(self, n: int):
         p = self.node_pids(n)
@@ -104,9 +108,10 @@ class PairSlots:
         self.assignments += 1
         return j, p, True
 
-    def state(self) -> dict:
-        return dict(tok=self.tok.copy(), pid=self.pid.copy(), pcnt=self.pcnt.copy(), plast=self.plast.copy(),
-                    pnode=self.pnode.copy(), pslot=self.pslot.copy(), free=self.free[:self.nfree].copy(),
+    def state(self, copy: bool = True) -> dict:
+        cp = (lambda a: a.copy()) if copy else (lambda a: a)               # copy=False: views, for a save that writes now
+        return dict(tok=cp(self.tok), pid=cp(self.pid), pcnt=cp(self.pcnt), plast=cp(self.plast),
+                    pnode=cp(self.pnode), pslot=cp(self.pslot), free=cp(self.free[:self.nfree]),
                     rng=self.rng.bit_generator.state, overflows=self.overflows, trash=self.trash,
                     assignments=self.assignments, pair_evictions=self.pair_evictions)
 
@@ -119,6 +124,186 @@ class PairSlots:
         self.rng.bit_generator.state = s["rng"]
         for k in ("overflows", "trash", "assignments", "pair_evictions"):
             setattr(self, k, int(s[k]))
+
+
+class PagedPairSlots(PairSlots):
+    """PairSlots with the same slots, stored in pages (Nov 15). At 1 GB the dense (P, K) tok/pid rows were ~3% used
+    (median successors per context 1, a few hot contexts near K) and held 4 of the 7.5 GiB checkpoint. Here a node's
+    logical slot j lives in page ptab[n, j // R] at offset j % R; pages come from a shared pool and return to it when the
+    node resets. A node's pages are always a prefix (slots fill first-empty-first, pages are freed only on reset), so the
+    pool needs at most NP / R + P pages if rows had no holes; holes from pair evictions add a little (measured on the
+    1 GB checkpoint: below that bound at R = 16). Same slot indices, same answers as PairSlots while the pool has pages;
+    if it runs dry a node that needs a new page takes the overflow path (counted in page_fallbacks)."""
+
+    def __init__(self, P: int, K: int, NP: int, lg_chunk: float, seed: int, R: int = 16, pages: int = 0):
+        self.P, self.K, self.NP = int(P), int(K), int(NP)
+        self.R = int(min(R, K))
+        assert self.K % self.R == 0, (K, R)
+        self.NG = self.K // self.R
+        self.NPAGE = int(pages) if pages else (self.NP + self.NP // 4) // self.R + self.P   # +25%: room for holes
+        self.ptab = np.full((self.P, self.NG), -1, np.int32)
+        self.ptok = np.full((self.NPAGE + 1, self.R), -1, np.int16)        # row NPAGE: the empty dummy page
+        self.ppid = np.full((self.NPAGE + 1, self.R), -1, np.int32)
+        self.pgfree = np.arange(self.NPAGE - 1, -1, -1, dtype=np.int32)
+        self.npgfree = self.NPAGE
+        self.pcnt = np.zeros(self.NP, np.int32)
+        self.plast = np.full(self.NP, -1, np.int64)
+        self.pnode = np.full(self.NP, -1, np.int32)
+        self.pslot = np.zeros(self.NP, np.int16)
+        self.free = np.arange(self.NP - 1, -1, -1, dtype=np.int32)
+        self.nfree = self.NP
+        self.lg = float(lg_chunk)
+        self.rng = np.random.default_rng(seed)
+        self.overflows = self.trash = self.assignments = self.pair_evictions = self.page_fallbacks = 0
+
+    def _pg(self, nodes):
+        g = self.ptab[nodes]
+        return np.where(g >= 0, g, self.NPAGE)
+
+    def rows(self, nodes: np.ndarray):
+        g = self._pg(nodes)
+        sh = g.shape[:-1] + (self.K,)
+        return self.ptok[g].reshape(sh).astype(np.int32), self.ppid[g].reshape(sh)
+
+    def node_pids(self, n: int) -> np.ndarray:
+        g = self.ptab[n]
+        p = self.ppid[g[g >= 0]].ravel()
+        return p[p >= 0]
+
+    def reset(self, n: int):
+        p = self.node_pids(n)
+        if len(p):
+            self.free[self.nfree:self.nfree + len(p)] = p
+            self.nfree += len(p)
+            self.pnode[p] = -1
+        g = self.ptab[n]
+        g = g[g >= 0]
+        if len(g):
+            self.ptok[g] = -1
+            self.ppid[g] = -1
+            self.pgfree[self.npgfree:self.npgfree + len(g)] = g[::-1]
+            self.npgfree += len(g)
+        self.ptab[n] = -1
+
+    def _put(self, n: int, j: int, y: int, p: int):
+        g = self.ptab[n, j // self.R]
+        self.ptok[g, j % self.R] = y
+        self.ppid[g, j % self.R] = p
+
+    def _alloc(self, ch: int) -> int:
+        if self.nfree:
+            self.nfree -= 1
+            return int(self.free[self.nfree])
+        for _ in range(4):
+            cand = self.rng.integers(0, self.NP, size=8)
+            cand = cand[self.plast[cand] != ch]
+            if len(cand):
+                sc = self.pcnt[cand] * np.exp(self.lg * (ch - self.plast[cand]))
+                p = int(cand[np.argmin(sc)])
+                n2, s2 = int(self.pnode[p]), int(self.pslot[p])
+                if n2 >= 0:
+                    self._put(n2, s2, -1, -1)
+                self.pair_evictions += 1
+                return p
+        return -1
+
+    def assign(self, n: int, y: int, ch: int):
+        # only the node's own pages are searched (a prefix of its page table); the median node has one
+        g = self.ptab[n]
+        na = int(np.count_nonzero(g >= 0))
+        ga = g[:na]
+        tr = self.ptok[ga].ravel()
+        hit = np.nonzero(tr == y)[0]
+        if len(hit):
+            j = int(hit[0])
+            p = int(self.ppid[ga].ravel()[j])
+            self.pcnt[p] = min(self.pcnt[p] + 1, 2**31 - 1)
+            self.plast[p] = ch
+            return j, p, False
+        emp = np.nonzero(tr < 0)[0]
+        if len(emp):
+            j = int(emp[0])                                # a hole in an allocated page (first empty, as dense)
+        elif na < self.NG and self.npgfree:
+            j = na * self.R                                # the first slot of the next page
+        else:
+            j = -1
+            if na < self.NG:
+                self.page_fallbacks += 1
+        if j >= 0:
+            p = self._alloc(ch)
+            if p < 0:
+                self.trash += 1
+                return self.K, -1, False
+            q = j // self.R
+            if self.ptab[n, q] < 0:
+                self.npgfree -= 1
+                self.ptab[n, q] = self.pgfree[self.npgfree]
+        else:
+            self.overflows += 1
+            pr = self.ppid[ga].ravel()
+            ok = np.nonzero((pr >= 0) & (self.plast[np.maximum(pr, 0)] != ch))[0]
+            if not len(ok):
+                self.trash += 1
+                return self.K, -1, False
+            j = int(ok[np.argmin(self.pcnt[pr[ok]])])
+            p = int(pr[j])
+        assert 0 <= y < 32768
+        self._put(n, j, y, p)
+        self.pnode[p] = n
+        self.pslot[p] = j
+        self.pcnt[p] = 1
+        self.plast[p] = ch
+        self.assignments += 1
+        return j, p, True
+
+    def state(self, copy: bool = True) -> dict:
+        cp = (lambda a: a.copy()) if copy else (lambda a: a)
+        return dict(paged=self.R, ptab=cp(self.ptab), ptok=cp(self.ptok), ppid=cp(self.ppid),
+                    pgfree=cp(self.pgfree[:self.npgfree]), pcnt=cp(self.pcnt), plast=cp(self.plast),
+                    pnode=cp(self.pnode), pslot=cp(self.pslot), free=cp(self.free[:self.nfree]),
+                    rng=self.rng.bit_generator.state, overflows=self.overflows, trash=self.trash,
+                    assignments=self.assignments, pair_evictions=self.pair_evictions, page_fallbacks=self.page_fallbacks)
+
+    def load(self, s: dict):
+        for k in ("pcnt", "plast", "pnode", "pslot"):
+            setattr(self, k, np.asarray(s[k]).astype(getattr(self, k).dtype).copy())
+        fr = np.asarray(s["free"], np.int32)
+        self.free[:len(fr)] = fr
+        self.nfree = len(fr)
+        self.rng.bit_generator.state = s["rng"]
+        for k in ("overflows", "trash", "assignments", "pair_evictions"):
+            setattr(self, k, int(s[k]))
+        self.page_fallbacks = int(s.get("page_fallbacks", 0))
+        if s.get("paged"):
+            assert int(s["paged"]) == self.R and np.asarray(s["ptok"]).shape[0] == self.NPAGE + 1
+            self.ptab = np.asarray(s["ptab"], np.int32).copy()
+            self.ptok = np.asarray(s["ptok"], np.int16).copy()
+            self.ppid = np.asarray(s["ppid"], np.int32).copy()
+            gf = np.asarray(s["pgfree"], np.int32)
+            self.pgfree[:len(gf)] = gf
+            self.npgfree = len(gf)
+            return
+        # a dense PairSlots state: lay its rows into pages (each node's pages a prefix up to its last used slot)
+        tok, pid = s["tok"], s["pid"]
+        self.ptab[:] = -1; self.ptok[:] = -1; self.ppid[:] = -1
+        nxt, B = 0, 1 << 14
+        for a in range(0, self.P, B):
+            t = np.asarray(tok[a:a + B]).reshape(-1, self.NG, self.R)
+            u = np.asarray(pid[a:a + B]).reshape(-1, self.NG, self.R)
+            used = (t >= 0).any(2)
+            need = np.where(used.any(1), self.NG - np.argmax(used[:, ::-1], 1), 0)
+            m = np.arange(self.NG)[None, :] < need[:, None]
+            cnt = int(m.sum())
+            assert nxt + cnt <= self.NPAGE, "page pool too small for this dense state"
+            ids = np.arange(nxt, nxt + cnt, dtype=np.int32)
+            blk = self.ptab[a:a + B]
+            blk[m] = ids
+            self.ptok[ids] = t[m].astype(np.int16)
+            self.ppid[ids] = u[m]
+            nxt += cnt
+        self.pgfree = np.arange(self.NPAGE - 1, nxt - 1, -1, dtype=np.int32)
+        self.pgfree = np.concatenate([self.pgfree, np.zeros(nxt, np.int32)])
+        self.npgfree = self.NPAGE - nxt
 
 
 class _PairRows:
@@ -141,8 +326,12 @@ class Core3(Core2):
         NPd = {1: int(c.get("np1", 524288)), 2: int(c.get("np2", 2097152)), 3: int(c.get("np3", 4194304)),
                4: int(c.get("np4", 4194304))}
         lgc = math.log(float(c["ctx_decay"])) * int(c["chunk"])
+        for k in self.skip_offs:                                # skip orders: pair pools sized like skip_size's order
+            NPd[k] = NPd[self.skip_like]
         self.NPk = {k: NPd[k] for k in self.orders}
-        self.slots = {k: PairSlots(self.PK[k], self.KK[k], self.NPk[k], lgc, 100 + k) for k in self.orders}
+        R = int(c.get("slot_page", 0))                         # Nov 15: > 0 stores slots in pages of R (PagedPairSlots)
+        self.slots = {k: (PagedPairSlots(self.PK[k], self.KK[k], self.NPk[k], lgc, 100 + k, R) if R > 0
+                          else PairSlots(self.PK[k], self.KK[k], self.NPk[k], lgc, 100 + k)) for k in self.orders}
         self.__dict__.pop("sc", None)
         if self.dev.type == "mps":
             torch.mps.empty_cache()
@@ -193,18 +382,19 @@ class Core3(Core2):
             M = np.full((len(n), S.K + 1), -1, np.int64)
             Pm = np.full((len(n), S.K + 1), self.NPk[k], np.int64)
             ok = n >= 0
-            M[ok, :S.K] = S.tok[n[ok]]
-            pp = S.pid[n[ok]].astype(np.int64)
+            tr, pr = S.rows(n[ok])
+            M[ok, :S.K] = tr
+            pp = pr.astype(np.int64)
             Pm[ok, :S.K] = np.where(pp >= 0, pp, self.NPk[k])
             out[f"v{k}"] = M >= 0
-            out[k] = torch.from_numpy(np.maximum(M, 0)).to(self.dev)
-            self._pidmap[k] = torch.from_numpy(Pm).to(self.dev)
+            out[k] = self._dv(np.maximum(M, 0))
+            self._pidmap[k] = self._dv(Pm)
         return out
 
     def _node_pairs(self, k, nodes: np.ndarray):
         """flat pair ids of the given nodes and, for each, the index of its node in `nodes`."""
         S = self.slots[k]
-        P = S.pid[nodes]
+        P = S.rows(nodes)[1]
         r, cidx = np.nonzero(P >= 0)
         return P[r, cidx].astype(np.int64), r
 
@@ -234,6 +424,33 @@ class Core3(Core2):
             slot[k], pair[k], new[k] = sk, pk, nk
         return slot, pair, new
 
+    @torch.no_grad()
+    def next_distribution(self, m: Matcher) -> torch.Tensor:
+        """the next token's distribution in context m (chat, dreams). The attention learner reads m's own last tokens,
+        exactly as a tick would for its first position (1.2.0: before this it read whatever window the last tick left)."""
+        if not isinstance(self.net, Learner3):
+            return super().next_distribution(m)
+        # 1.2.1: a training tick's geometry, with a KV cache. A window is anchored on the last ctx - chunk + 1 tokens (as a
+        # tick's first prediction sees them) and grows by one position per new token until it is full, then re-anchors.
+        # The cache lives on the context (a clone starts without one) and is dropped when the weights move.
+        ts, ctx = m.t, self.net.ctx
+        ver = (id(self.net), self.chunks)
+        g = getattr(m, "_gen", None)
+        if not (g is not None and g["ver"] == ver and ts == g["start"] + g["n"] + 1 and g["n"] < ctx):
+            L = max(1, min(ts, ctx - int(self.c["chunk"]) + 1))
+            seq = m.R[np.arange(ts - L, ts) % m.ring] if ts > 0 else np.zeros(1, np.int64)
+            g = dict(ver=ver, start=ts - L if ts > 0 else 0, n=0, kv=[])
+            m._gen = g
+        else:
+            seq = m.R[[(ts - 1) % m.ring]]
+        self.net.seq = self._dv(np.asarray(seq, np.int64))
+        self.net.past_use = None
+        self.net.gen = g
+        try:
+            return super().next_distribution(m)
+        finally:
+            self.net.gen = None
+
     def step(self, m: Matcher, ys, learn: bool = True):
         ys = np.asarray(ys, np.int64)
         C = len(ys)
@@ -241,6 +458,15 @@ class Core3(Core2):
         t0 = self.clock
         self._t('_start')
         ids, rec, mp, mb, win = self._contexts(m, ys, learn)
+        if isinstance(self.net, Learner3):                 # the attention learner reads the stream's recent tokens
+            assert not isinstance(m, (list, tuple)), "the attention learner takes one stream"
+            ts = m.t - C                                   # the clock of ys[0] in this context
+            L = max(1, min(ts, self.net.ctx - C + 1))
+            prev = m.R[np.arange(ts - L, ts) % m.ring] if ts > 0 else np.zeros(1, np.int64)
+            self.net.seq = self._dv(np.concatenate([prev, ys[:-1]]).astype(np.int64))
+            if self.net.past_on:                           # this stream's own earlier reads, if they end where we start
+                ok = learn and getattr(self, "_past", None) is not None and self._past_end == ts
+                self.net.past_use = self._past if ok else None
         idt = self._idt(ids)
         gid = self._gids(ids, rec, C)
         self._t('cpu contexts')
@@ -249,14 +475,14 @@ class Core3(Core2):
                 for k in self.orders:
                     if rec[k]:
                         nodes = np.array([n for _, n in rec[k]], np.int64)
-                        nd = torch.from_numpy(nodes).to(d)
-                        self.st[k][nd] = 0.0
-                        self.sl[k][nd] = t0
+                        nd = self._dv(nodes)
+                        self.st[k].index_fill_(0, nd, 0.0)    # index_fill_, not x[i] = 0.0: see _dv
+                        self.sl[k].index_fill_(0, nd, t0)
                         pp, _ = self._node_pairs(k, nodes)
                         if len(pp):
-                            self.pc[k][torch.from_numpy(pp).to(d)] = 0.0
+                            self.pc[k].index_fill_(0, self._dv(pp), 0.0)
         maps = self._maps2(ids)
-        y = torch.from_numpy(ys).to(d)
+        y = self._dv(ys)
         self._t('maps + recycles')
         # learner decimation. The learner predicts every token either way; what changes is what it learns from.
         #   skip        its optimiser steps on one tick in learn_stride; the other ticks give it no gradient
@@ -276,7 +502,7 @@ class Core3(Core2):
             lgrad = learn and nsel > 0
             self._sel_mass = getattr(self, "_sel_mass", 0.0) + (nsel if learn else 0)
             upd = learn and self._sel_mass + 1e-9 >= Q
-            rows = torch.from_numpy(rows_np).to(d) if rows_np is not None and nsel > 0 else None
+            rows = self._dv(rows_np) if rows_np is not None and nsel > 0 else None
         else:
             s_ = max(1, int(self.c.get("learn_stride", 1)))
             acc_ = mode == "accumulate"
@@ -284,6 +510,7 @@ class Core3(Core2):
             lgrad = learn and (s_ == 1 or upd or acc_)
             rows, rows_np, nsel = None, None, C
         self.net.keep_h = lgrad and self.io2 is not None             # io2's residual comes from the backward pass
+        self._loo = self._loo_delta(t0) if (lgrad and getattr(self, 'loo_ages', None)) else None
         lpE, lpL, key, deep = self._read2(idt, gid, maps, ys, mp, mb, win, t0, grad=lgrad, rows=rows)
         self.net.keep_h = False
         lyE = lpE.gather(1, y[:, None])[:, 0]
@@ -296,12 +523,17 @@ class Core3(Core2):
             self.acc[:3] += torch.stack([-lyE.detach().sum(), -lyL.detach().sum(), -torch.log(pf).sum()]) / math.log(2)
             self.acc[4] += (pfull.argmax(-1) == y).float().sum()
             self.acc[5] += C
-        self.last = dict(tokens=ys, bits=-torch.log2(pf), exact=-lyE.detach() / math.log(2), next=pfull[-1].topk(5))
+        self.last = dict(tokens=ys, bits=-torch.log2(pf), exact=-lyE.detach() / math.log(2), next=pfull[-1].topk(5),
+                         learner=-lyL.detach() / math.log(2), deep=deep)          # deep: the store's deepest known order, per token
         if getattr(self, 'probe', None) is not None:          # before any learning from this tick
             self.probe(self, y, sg, lpE.detach(), lpL.detach())
         self._t('scoring')
         if not learn:
             return -torch.log2(pf)
+        if isinstance(self.net, Learner3) and self.net.past_on and self.net.feat_now is not None:
+            keep = self.net.ctx - C                        # bounded: the most earlier positions a window holds
+            pp = self.net.feat_now if self.net.past_use is None else torch.cat([self.net.past_use, self.net.feat_now], 0)
+            self._past, self._past_end = pp[pp.shape[0] - keep:].clone() if keep > 0 else None, m.t
         lossE = -lyE.mean()
         if lgrad:
             if sel_:
@@ -312,12 +544,34 @@ class Core3(Core2):
             else:
                 if not acc_:
                     self.opt.zero_grad()
-                (-lyL.mean() / (s_ if acc_ else 1)).backward()
+                lyT = lyL if self._lpL_train is None else self._lpL_train.gather(1, y[:, None])[:, 0]
+                (-lyT.mean() / (s_ if acc_ else 1)).backward()
         gE = torch.autograd.grad(lossE, [self.wE, self.wM])
         slot, pair, new = self._assign(ids, rec, ys)          # CPU, while the GPU runs the read and backward
         self._t('backward')
         with torch.no_grad():
             self.theta.index_put_((key,), float(self.c["gate_lr"]) * sg * (1 - sg) * (a_ - b_) / pf, accumulate=True)
+        wu = int(self.c.get("warmup", 0))                  # dev: the learner's rate ramps over its first `warmup` steps
+        if upd and self.c.get("rate_ctl", "fixed") == "agree":
+            if not (wu and self.chunks < wu):
+                self._agree()
+            base = float(getattr(self, "ctl_lr", self.c["lr"]))
+            f = (self.chunks + 1) / wu if (wu and self.chunks < wu) else 1.0
+            for g in self.opt.param_groups:
+                g["lr"] = base * f
+        elif upd and self.c.get("rate_ctl", "fixed") == "hyper":
+            if not (wu and self.chunks < wu):
+                self._hyper_pre()
+            base = float(getattr(self, "ctl_lr", self.c["lr"]))
+            f = (self.chunks + 1) / wu if (wu and self.chunks < wu) else 1.0
+            for g in self.opt.param_groups:
+                g["lr"] = base * f
+            if not (wu and self.chunks < wu):
+                self._hg_snap()
+        elif upd and wu and self.chunks < wu:
+            base = self.io2.lr() if self.io2 is not None else float(self.c["lr"])
+            for g in self.opt.param_groups:
+                g["lr"] = base * (self.chunks + 1) / wu
         if not upd:
             pass
         elif self.bounded:
@@ -336,8 +590,16 @@ class Core3(Core2):
                 bounds.compress_(params, before)
         else:
             self.opt.step()
+        if upd and getattr(self, "_hg_prev", None) is not None and self.c.get("rate_ctl", "fixed") == "hyper" \
+                and not (wu and self.chunks < wu):
+            self._hyper_post()
+        if upd and int(self.c.get("rehearse", 0)) and not (acc_ or sel_):
+            self._rehearse()
         if upd and (acc_ or sel_):
             self.opt.zero_grad()
+        elif upd:
+            self.opt.zero_grad(set_to_none=True)          # 1.2.1: free the grads now, not at the next backward (0.4 GB
+                                                          # at 768 held through the next tick's forward); same maths
         if upd and sel_:
             self._sel_mass = 0.0
         if self.chunks % 1024 == 0:
@@ -386,23 +648,23 @@ class Core3(Core2):
             self.n0 += wj.sum(0)
             for k in self.orders:
                 if new[k]:
-                    self.pc[k][torch.tensor(new[k], device=d)] = 0.0
+                    self.pc[k].index_fill_(0, self._dv(np.asarray(new[k], np.int64)), 0.0)
                 idc = idt[k]
                 Un = np.unique(ids[k - 1])
                 Un = Un[Un >= 0]
-                U = torch.from_numpy(Un).to(d)
+                U = self._dv(Un)
                 f = keep[None] ** (te - self.sl[k][U]).float()[:, None]                  # (|U|, NB)
                 pp, owner = self._node_pairs(k, Un)
                 if len(pp):
-                    self.pc[k][torch.from_numpy(pp).to(d)] *= f[torch.from_numpy(owner).to(d)]
+                    self.pc[k][self._dv(pp)] *= f[self._dv(owner)]
                 self.st[k][U] *= f
-                self.sl[k][U] = te
-                pj = torch.from_numpy(pair[k]).to(d)[:, None].expand(C, NB)
+                self.sl[k].index_fill_(0, U, te)
+                pj = self._dv(pair[k])[:, None].expand(C, NB)
                 self.pc[k].index_put_((pj, ib), wj, accumulate=True)
                 ix = idc[:, None].expand(C, NB)
                 self.st[k].index_put_((ix, ib), wj, accumulate=True)
-                self.pc[k][self.NPk[k]] = 0.0
-                self.st[k][self.PK[k]] = 0.0
+                self.pc[k][self.NPk[k]].zero_()
+                self.st[k][self.PK[k]].zero_()
         self._t('store update')
         self.clock += C
         self.chunks += 1
@@ -412,6 +674,57 @@ class Core3(Core2):
         if self.clock >= self.rebase_at:
             self._rebase()
         return -torch.log2(pf)
+
+    def _bounded_step(self):
+        """one optimiser step under the model's bounding, exactly as the tick's own step."""
+        params = [p for p in self.net.parameters()]
+        if not self.bounded:
+            self.opt.step()
+        elif self.bound_mode == "sphere":
+            self.opt.step()
+        elif self.bound_mode == "wd":
+            bounds.clip_(params, 1.0)
+            self.opt.step()
+            with torch.no_grad():
+                torch._foreach_clamp_min_(self._vecs, -8.0); torch._foreach_clamp_max_(self._vecs, 8.0)
+        else:
+            before = bounds.norms_before(params)
+            bounds.clip_(params, 1.0)
+            self.opt.step()
+            bounds.compress_(params, before)
+
+    def _rehearse(self):
+        """rehearsal (dev, Nov 10; James: "rehearsal sounds like the right way to level the playing field"). Extra
+        learner steps per tick on reads taken BEFORE their tick's store update, so the store never hands the learner
+        the answer it has since counted. The token projection P is applied fresh, so it learns too. span 1 repeats
+        the current tick; span D picks each step's tick from the last D (a transient cache: it refills in D ticks
+        after a resume, and is not part of the checkpoint). io2 hears none of it."""
+        R, D = int(self.c["rehearse"]), int(self.c.get("rehearse_span", 1))
+        q = self.__dict__.setdefault("_rq", [])
+        q.append(self._pack); self._pack = None
+        del q[:-D]
+        rng = self.__dict__.setdefault("_rrng", np.random.default_rng(int(self.c.get("seed", 0)) + 7))
+        keep, self.net.keep_h = self.net.keep_h, False
+        for _ in range(R):
+            pk = q[-1] if D == 1 else q[int(rng.integers(len(q)))]
+            self.opt.zero_grad(set_to_none=True)
+            lp = torch.log_softmax(self._learner(pk["wt"], self._feat(pk, None)), -1)
+            (-lp.gather(1, pk["y"][:, None]).mean()).backward()
+            self._bounded_step()
+        self.opt.zero_grad(set_to_none=True)
+        self.net.keep_h = keep
+
+    def _loo_delta(self, t0):
+        """(NB,) what this position's earlier instances weigh now: keep^age on each decaying rung, 0.5^halvings on the
+        all-time rung, summed over the earlier passes (ages from run.py: the same text, whole passes back)."""
+        keep = 1.0 - self.ab.detach().cpu().double().numpy()
+        hc = np.asarray(getattr(self, "_halv_clocks", []), np.float64)
+        out = np.zeros(self.NB)
+        for D in self.loo_ages:
+            dl = keep ** float(D)
+            dl[-1] = 0.5 ** int((hc > t0 - D).sum())
+            out += dl
+        return self._dv(out.astype(np.float32))
 
     def _sel_stride(self, mode) -> int:
         """the prediction stride: learn_stride, or io2's (rma's rule: integers dithered so 1/stride averages 1/target)."""
@@ -429,6 +742,173 @@ class Core3(Core2):
             return upper
         return lower
 
+    @torch.no_grad()
+    def _agree(self):
+        """rate_ctl=agree (Nov 13; James: plasticity should depend on what an error means given the model's state).
+        c = cosine between where this tick's error would move the weights and where the last step moved them.
+        c > 0: the last step fell short, the error is systematic (learnable): raise the rate. c < 0: it overshot, the
+        error is noise at the model's present resolution: lower it. log lr += ctl_k * c. Nothing here counts age.
+        ctl_signal 'adam' (Nov 13, v1): last step = Adam's m/(sqrt v + eps), error = the raw gradient. Failed (Nov 14):
+          c stayed > 0 at every rate up to 1e-2, because weight decay's steady pull is balanced by a steady gradient,
+          which reads as permanent agreement.
+        ctl_signal 'total' (v2): both in the step's own coordinates and including the decay, the way AdamW moves:
+          last step D = m_hat/(sqrt v_hat + eps) + wd*theta; this error G = g/(sqrt v_hat + eps) + wd*theta. At a
+          settled point E[D] = 0 (decay and gradient cancel), so only the fluctuation is left to agree or not."""
+        sig = str(self.c.get("ctl_signal", "adam"))
+        if sig == "lag":
+            return self._agree_lag()
+        num = den_g = den_d = None
+        for grp in self.opt.param_groups:
+            ps = [p for p in grp["params"] if p.grad is not None and self.opt.state.get(p) and "exp_avg" in self.opt.state[p]]
+            if not ps:
+                continue
+            st = [self.opt.state[p] for p in ps]; eps = grp["eps"]
+            ms = [x["exp_avg"] for x in st]; vs = [x["exp_avg_sq"] for x in st]; gs = [p.grad for p in ps]
+            if sig == "total":
+                b1, b2 = grp["betas"]; n = float(st[0]["step"])
+                bc1, bc2 = 1 - b1 ** n, 1 - b2 ** n
+                den = torch._foreach_div(vs, bc2); den = torch._foreach_sqrt(den); torch._foreach_add_(den, eps)
+                ds = torch._foreach_div(ms, den); torch._foreach_div_(ds, bc1)
+                es = torch._foreach_div(gs, den)
+                wd = float(grp.get("weight_decay", 0.0))
+                if wd:
+                    torch._foreach_add_(ds, ps, alpha=wd); torch._foreach_add_(es, ps, alpha=wd)
+            else:
+                den = torch._foreach_sqrt(vs); torch._foreach_add_(den, eps); ds = torch._foreach_div(ms, den); es = gs
+            n_ = torch.stack([(e * d).sum() for e, d in zip(es, ds)]).sum()
+            ge = torch.stack(torch._foreach_norm(es)).pow(2).sum(); gd = torch.stack(torch._foreach_norm(ds)).pow(2).sum()
+            num = n_ if num is None else num + n_
+            den_g = ge if den_g is None else den_g + ge
+            den_d = gd if den_d is None else den_d + gd
+        if num is None:
+            return
+        c = float(num / (den_g * den_d).sqrt().clamp_min(1e-30))
+        lr = float(getattr(self, "ctl_lr", self.c["lr"])) * math.exp(float(self.c.get("ctl_k", 0.05)) * c)
+        self.ctl_lr = min(float(self.c.get("ctl_max", 1e-2)), max(float(self.c.get("ctl_min", 1e-6)), lr))
+        self.ctl_cos = 0.99 * float(getattr(self, "ctl_cos", 0.0)) + 0.01 * c
+
+    @torch.no_grad()
+    def _agree_lag(self):
+        """ctl_signal 'lag' (Nov 14, v3). One-step agreement can't judge the learner: a document spans several ticks,
+        so successive errors agree and a faster step does help the next tick (v1/v2 ran to the cap). Judge it on its
+        own timescale instead: c = cos(-S, theta - theta_old), S = g/(sqrt v_hat + eps) + wd*theta (the AdamW step this
+        error asks for, decay included), theta_old a snapshot L..2L steps back (L = ctl_lag, well past a document).
+        Settled: theta - theta_old is mostly past noise that the gradient pulls back, c < 0, the rate falls. Drifting:
+        the error keeps pointing where the weights have been heading, c > 0, it rises. Two snapshots (2x the learner)."""
+        L = int(self.c.get("ctl_lag", 64))
+        D = float(self.c.get("ctl_drift", 0.0))          # v4 (Nov 15): lag = D / lr, the learner's own timescale
+        sub = max(1, int(self.c.get("ctl_sub", 1)))      # v4: judge on every sub-th coordinate (sketch; snapshots /sub)
+        lr_now = float(getattr(self, "ctl_lr", self.c["lr"]))
+        if D > 0:
+            L = int(min(int(self.c.get("ctl_lag_max", 4096)), max(int(self.c.get("ctl_lag_min", 8)), round(D / lr_now))))
+        ps_all, es_all = [], []
+        for grp in self.opt.param_groups:
+            ps = [p for p in grp["params"] if p.grad is not None and self.opt.state.get(p) and "exp_avg" in self.opt.state[p]]
+            if not ps:
+                continue
+            st = [self.opt.state[p] for p in ps]; b1, b2 = grp["betas"]; n = float(st[0]["step"])
+            vs = [x["exp_avg_sq"] for x in st]; gs = [p.grad for p in ps]; pv = ps
+            if sub > 1:
+                vs = [v.reshape(-1)[::sub] for v in vs]; gs = [g.reshape(-1)[::sub] for g in gs]; pv = [p.reshape(-1)[::sub] for p in ps]
+            den = torch._foreach_div(vs, 1 - b2 ** n); den = torch._foreach_sqrt(den)
+            torch._foreach_add_(den, grp["eps"]); es = torch._foreach_div(gs, den)
+            wd = float(grp.get("weight_decay", 0.0))
+            if wd:
+                torch._foreach_add_(es, pv, alpha=wd)
+            ps_all += pv; es_all += es
+        if not ps_all:
+            return
+        k = getattr(self, "_lag_k", 0); self._lag_k = k + 1
+        old = getattr(self, "_snap_old", None)
+        if old is not None and len(old) == len(ps_all) and all(o.shape == q.shape for o, q in zip(old, ps_all)):
+            disp = torch._foreach_sub(ps_all, old)
+            num = -torch.stack([(e * d).sum() for e, d in zip(es_all, disp)]).sum()
+            ne = torch.stack(torch._foreach_norm(es_all)).pow(2).sum(); nd = torch.stack(torch._foreach_norm(disp)).pow(2).sum()
+            c = float(num / (ne * nd).sqrt().clamp_min(1e-30))
+            lr = lr_now * math.exp(float(self.c.get("ctl_k", 0.05)) * c)
+            self.ctl_lr = min(float(self.c.get("ctl_max", 1e-2)), max(float(self.c.get("ctl_min", 1e-6)), lr))
+            self.ctl_cos = 0.99 * float(getattr(self, "ctl_cos", 0.0)) + 0.01 * c
+        if D > 0:                                          # rotate when the newer snapshot is L steps old
+            if k - getattr(self, "_snap_k", -10**9) >= L:
+                self._snap_old = getattr(self, "_snap_new", None)
+                self._snap_new = [p.detach().clone() for p in ps_all]; self._snap_k = k
+        elif k % L == 0:                                   # rotate: the snapshot in use is always L..2L steps old
+            self._snap_old = getattr(self, "_snap_new", None)
+            self._snap_new = [p.detach().clone() for p in ps_all]
+        self.ctl_L = L
+
+    # ---- rate_ctl=hyper (Nov 15; spec lab/specs/hypergrad_controller.md, James's yes the same day) ----------------
+    # The log-rate beta descends the prequential loss: d L_{t+1} / d beta = g_{t+1} . h_t, h_t = d theta_t / d beta, the
+    # rate held constant over the past. g_{t+1} is this tick's learning gradient (taken at theta_t, before the step).
+    # h's recursion through an AdamW step theta' = theta - a (u + wd theta), a = e^beta:
+    #   h' = h (1 - a wd) + d_theta - a (du/dtheta) h          (d_theta = the step actually taken, = d(-a u)/d beta)
+    # hg_tier 0: h' = d_theta (one step; Baydin et al. 2018). Expected to behave like agree v1 (judged on the next tick).
+    # hg_tier 1: du/dtheta ~ diag curvature / (sqrt v_hat + eps), curvature ~ N v_hat (Fisher of the per-token mean loss;
+    #            v_hat is the second moment of an N-token mean gradient), N = hg_curv (0 -> the tick, chunk). The trace
+    #            forgets at the rate the surface pulls weights back; nothing here is a window we chose (test 3 varies N).
+    # Meta-step: beta -= hg_mu * x / rms(x), x = g . h, rms over ~1/(1 - hg_rms) ticks; beta clamped to
+    # [lr0 / hg_span, lr0 * hg_span] as a rail (clamp hits are counted and reported: a hit is a failure, not a feature).
+    @torch.no_grad()
+    def _hyper_pre(self):
+        h = getattr(self, "_hg_h", None)
+        ps = [p for p in self.net.parameters()]
+        lr0 = float(self.c["lr"])
+        if not hasattr(self, "ctl_lr"):
+            self.ctl_lr = lr0
+        if h is None or any(p.grad is None for p in ps):
+            return
+        x = float(torch.stack([(p.grad * q).sum() for p, q in zip(ps, h)]).sum())
+        if not math.isfinite(x):
+            return
+        rd = float(self.c.get("hg_rms", 0.99))
+        self._hg_n = getattr(self, "_hg_n", 0) + 1
+        self._hg_r = rd * getattr(self, "_hg_r", 0.0) + (1 - rd) * x * x
+        r = math.sqrt(self._hg_r / (1 - rd ** self._hg_n))
+        z = x / r if r > 0 else 0.0
+        span = float(self.c.get("hg_span", 30.0))
+        b = math.log(self.ctl_lr) - float(self.c.get("hg_mu", 0.01)) * z
+        lo, hi = math.log(lr0 / span), math.log(lr0 * span)
+        if b <= lo or b >= hi:
+            self.hg_clamps = getattr(self, "hg_clamps", 0) + 1
+        self.ctl_lr = math.exp(min(hi, max(lo, b)))
+        self.ctl_cos = 0.99 * float(getattr(self, "ctl_cos", 0.0)) + 0.01 * z     # logged: the normalised hypergradient
+
+    @torch.no_grad()
+    def _hg_snap(self):
+        ps = [p.detach() for p in self.net.parameters()]
+        if getattr(self, "_hg_prev", None) is None:
+            self._hg_prev = [p.clone() for p in ps]
+        else:
+            torch._foreach_copy_(self._hg_prev, ps)
+
+    @torch.no_grad()
+    def _hyper_post(self):
+        tier = int(self.c.get("hg_tier", 1))
+        if not hasattr(self, "_hg_index"):
+            self._hg_index = {id(p): i for i, p in enumerate(self.net.parameters())}
+        allp = [p.detach() for p in self.net.parameters()]
+        d = torch._foreach_sub(allp, self._hg_prev)                           # the step taken, clip and clamps included
+        h = getattr(self, "_hg_h", None)
+        if tier == 0 or h is None:
+            self._hg_h = d
+            return
+        N = float(self.c.get("hg_curv", 0)) or float(self.c["chunk"])
+        for grp in self.opt.param_groups:
+            a, wd, eps = float(grp["lr"]), float(grp.get("weight_decay", 0.0)), float(grp["eps"])
+            b2 = grp["betas"][1]
+            for p in grp["params"]:
+                i = self._hg_index[id(p)]; st = self.opt.state.get(p)
+                keep = None
+                if st and "exp_avg_sq" in st:
+                    n = float(st["step"]); vh = st["exp_avg_sq"] / (1 - b2 ** n)
+                    keep = 1.0 - a * wd - a * N * vh / (vh.sqrt() + eps)
+                    keep.clamp_(0.0, 1.0)
+                if keep is None:
+                    h[i].mul_(1.0 - a * wd)
+                else:
+                    h[i].mul_(keep)
+                h[i].add_(d[i])
+
     def _io2_flush(self):
         pend, self._io2_pending = getattr(self, "_io2_pending", None), None
         if pend is None or self.io2 is None:
@@ -441,6 +921,7 @@ class Core3(Core2):
 
     @torch.no_grad()
     def _halve(self):
+        self.__dict__.setdefault("_halv_clocks", []).append(self.clock)       # for leave-one-out reads
         self.r0[-1] *= 0.5
         self.n0[-1] *= 0.5
         for k in self.orders:
@@ -463,12 +944,18 @@ class Core3(Core2):
             self.sl[k] -= off
             self.slots[k].plast -= offc
         for k, pool in self.pools.items():
-            pool.last = [v - off for v in pool.last]
+            pool.last = pool.last - off
         self.chunks -= offc
         self.rebases = getattr(self, "rebases", 0) + 1
 
     def stats(self) -> dict:
         out = super().stats()
+        if hasattr(self, "ctl_cos"):
+            out["ctl_cos"] = float(self.ctl_cos)
+        if hasattr(self, "ctl_L"):
+            out["ctl_L"] = int(self.ctl_L)
+        if hasattr(self, "ctl_lr") and self.c.get("rate_ctl", "fixed") == "hyper":
+            out["lr"] = float(self.ctl_lr); out["hg_clamps"] = int(getattr(self, "hg_clamps", 0))
         if self.bounded:
             out.update(bounds.pressure(list(self.net.parameters())))
             out["max_abs_theta"] = float(self.theta.abs().max())
@@ -477,26 +964,40 @@ class Core3(Core2):
             out[f"o{k}_pairs"] = S.NP - S.nfree
             out[f"o{k}_pair_fill"] = (S.NP - S.nfree) / S.NP
             out[f"o{k}_pair_evictions"] = S.pair_evictions
+            if isinstance(S, PagedPairSlots):
+                out[f"o{k}_page_fill"] = (S.NPAGE - S.npgfree) / S.NPAGE
+                out[f"o{k}_page_fallbacks"] = S.page_fallbacks
         return out
 
     # ---- state (bounded and self-contained: everything the learner carries) ----
-    def state_dict(self) -> dict:
+    def state_dict(self, lean: bool = False) -> dict:
+        """lean=True (1.2.1, for a save that writes at once): no copies. Device tensors stay where they are (torch.save
+        moves one storage at a time) and the store's arrays are views. The default makes an independent CPU copy."""
         self._io2_flush()
         if self.dev.type == "mps":
             torch.mps.synchronize()
-        cpu = lambda t: t.detach().to("cpu").clone()
+        cpu = (lambda t: t.detach()) if lean else (lambda t: t.detach().to("cpu").clone())
         return dict(
             engine="core3", config=dict(self.c), clock=self.clock, r0_t=self.r0_t, n0_all=self.n0_all,
             halvings=self.halvings, chunks=self.chunks, rebases=getattr(self, "rebases", 0),
             r0=cpu(self.r0), n0=cpu(self.n0),
             pc={str(k): cpu(self.pc[k]) for k in self.orders}, st={str(k): cpu(self.st[k]) for k in self.orders},
             sl={str(k): cpu(self.sl[k]) for k in self.orders},
-            slots={str(k): self.slots[k].state() for k in self.orders},
+            slots={str(k): self.slots[k].state(copy=not lean) for k in self.orders},
             pools={str(k): self.pools[k].state() for k in self.pools},
             net=self.net.state_dict(), opt=self.opt.state_dict(), mopt=self.mopt.state_dict(),
             wE=cpu(self.wE), wM=cpu(self.wM), theta=cpu(self.theta),
             io2=self.io2.state() if self.io2 is not None else None,
             sel=dict(mass=float(getattr(self, "_sel_mass", 0.0)), phase=float(getattr(self, "_sel_phase", 0.0))),
+            past=None if getattr(self, "_past", None) is None else dict(f=cpu(self._past), end=int(self._past_end)),
+            ctl=dict(lr=float(self.ctl_lr), cos=float(getattr(self, "ctl_cos", 0.0)), k=int(getattr(self, "_lag_k", 0)),
+                     snap_k=int(getattr(self, "_snap_k", -10**9)),
+                     old=[t.cpu() for t in self._snap_old] if getattr(self, "_snap_old", None) else None,
+                     new=[t.cpu() for t in self._snap_new] if getattr(self, "_snap_new", None) else None,
+                     hg_h=[t.cpu() for t in self._hg_h] if getattr(self, "_hg_h", None) else None,
+                     hg_r=float(getattr(self, "_hg_r", 0.0)), hg_n=int(getattr(self, "_hg_n", 0)),
+                     hg_clamps=int(getattr(self, "hg_clamps", 0)))
+                if hasattr(self, "ctl_lr") else None,
         )
 
     def load_state_dict(self, s: dict):
@@ -522,5 +1023,16 @@ class Core3(Core2):
             self.theta.copy_(s["theta"].to(d))
         if self.io2 is not None and s.get("io2") is not None:
             self.io2.load(s["io2"])
+        p_ = s.get("past")
+        self._past, self._past_end = (p_["f"].to(d), int(p_["end"])) if p_ else (None, -1)
+        if s.get("ctl"):
+            self.ctl_lr, self.ctl_cos = float(s["ctl"]["lr"]), float(s["ctl"]["cos"])
+            cs = s["ctl"]; self._lag_k = int(cs.get("k", 0)); self._snap_k = int(cs.get("snap_k", -10**9))
+            for nm in ("old", "new"):
+                if cs.get(nm) is not None:
+                    setattr(self, "_snap_" + nm, [t.to(d) for t in cs[nm]])
+            if cs.get("hg_h") is not None:
+                self._hg_h = [t.to(d) for t in cs["hg_h"]]
+            self._hg_r, self._hg_n, self.hg_clamps = float(cs.get("hg_r", 0.0)), int(cs.get("hg_n", 0)), int(cs.get("hg_clamps", 0))
         sel = s.get("sel") or {}
         self._sel_mass, self._sel_phase = float(sel.get("mass", 0.0)), float(sel.get("phase", 0.0))

@@ -23,6 +23,11 @@ import math
 
 import numpy as np
 import torch
+import torch.utils.checkpoint
+try:
+    from . import flash_mps                                                 # 1.2.1: Metal flash attention (MPS)
+except ImportError:
+    import flash_mps
 
 from .core import LB, NE, ENT_EDGES, PHI, DEFAULTS, IDENTITY, Matcher, Pool, Slots, Core as _Core
 from .io2 import IO2
@@ -40,6 +45,127 @@ class Block(torch.nn.Module):
 
     def forward(self, h):
         return h + self.down(torch.nn.functional.gelu(self.up(self.ln(h))))
+
+
+class AttnBlock(torch.nn.Module):
+    """a pre-LayerNorm causal self-attention block with a GELU MLP (GPT-2 form)."""
+    def __init__(self, H, heads, L):
+        super().__init__()
+        self.heads = heads
+        self.flash = False                                                   # set by the core (att_kernel)
+        self.l1 = torch.nn.LayerNorm(H); self.qkv = torch.nn.Linear(H, 3 * H); self.o = torch.nn.Linear(H, H)
+        self.l2 = torch.nn.LayerNorm(H); self.f1 = torch.nn.Linear(H, 4 * H); self.f2 = torch.nn.Linear(4 * H, H)
+        for m, sd in ((self.qkv, 0.02), (self.f1, 0.02), (self.o, 0.02 / (2 * L) ** 0.5), (self.f2, 0.02 / (2 * L) ** 0.5)):
+            torch.nn.init.normal_(m.weight, 0.0, sd); torch.nn.init.zeros_(m.bias)
+
+    def forward(self, x):                                                    # (1, T, H)
+        B, T, H = x.shape
+        q, k, v = self.qkv(self.l1(x)).view(B, T, 3, self.heads, H // self.heads).permute(2, 0, 3, 1, 4)
+        if self.flash and flash_mps.supported(q):                          # 1.2.1: no T x T is ever stored
+            a = flash_mps.FlashAttn.apply(q, k, v).transpose(1, 2).reshape(B, T, H)
+        else:
+            a = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True).transpose(1, 2).reshape(B, T, H)
+        x = x + self.o(a)
+        return x + self.f2(torch.nn.functional.gelu(self.f1(self.l2(x))))
+
+    def forward_kv(self, x, kv):
+        """generation (1.2.1): x holds new positions only; kv = [K, V] of the earlier ones (grown in place)."""
+        B, T, H = x.shape
+        q, k, v = self.qkv(self.l1(x)).view(B, T, 3, self.heads, H // self.heads).permute(2, 0, 3, 1, 4)
+        if kv[0] is None:
+            kv[0], kv[1] = k, v
+            a = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
+        else:
+            kv[0], kv[1] = torch.cat([kv[0], k], 2), torch.cat([kv[1], v], 2)
+            assert T == 1, "one new position at a time"
+            a = torch.nn.functional.scaled_dot_product_attention(q, kv[0], kv[1])
+        x = x + self.o(a.transpose(1, 2).reshape(B, T, H))
+        return x + self.f2(torch.nn.functional.gelu(self.f1(self.l2(x))))
+
+
+class Learner3(torch.nn.Module):
+    """the attention learner (dev, Nov 10; James: "what if the learner just had more exact tokens … make the present
+    a richer picture"). A causal transformer over the last `ctx` exact tokens of the stream (read from the matcher's
+    ring: nothing new is stored), with the store's features for each new position added to its input. The core sets
+    `seq` before each call: the earlier tokens, then the inputs of the C positions being predicted."""
+    def __init__(self, V, DP, O, NB, H, L, heads, ctx, inject="input", past=0):
+        super().__init__()
+        # past=1 (dev, Nov 11; James: does attention run over every layer?): the window's earlier positions carry the
+        # store reads made when they were predicted (core3 keeps them, bounded to ctx - C rows), so every layer sees
+        # the store at every position, not only at the tick's own. Honest: each read is from its own time.
+        self.past_on, self.past_use, self.feat_now = bool(past), None, None
+        self.inject = inject                                                   # "input" | "every" (each block's input)
+        self.emb = torch.nn.Embedding(V, H); self.pos = torch.nn.Embedding(ctx, H)
+        torch.nn.init.normal_(self.emb.weight, 0.0, 0.02); torch.nn.init.normal_(self.pos.weight, 0.0, 0.02)
+        self.P = torch.nn.Parameter(torch.randn(V, DP) * 0.5)
+        self.ln = torch.nn.LayerNorm(O * NB * (DP + 1))
+        self.cell = torch.nn.Linear(O * NB * (DP + 1), H, bias=False)
+        # "every+mlp": the store's features through a small dense network first, as the current learner treats them
+        self.fmlp = torch.nn.Sequential(torch.nn.GELU(), torch.nn.Linear(H, H), torch.nn.GELU(), torch.nn.Linear(H, H)) \
+            if inject.endswith("+mlp") else None
+        self.blocks = torch.nn.ModuleList([AttnBlock(H, heads, L) for _ in range(L)])
+        self.ln_f = torch.nn.LayerNorm(H)
+        self.out = torch.nn.Linear(H, V)
+        self.keep_h, self.h, self.seq, self.ctx = False, None, None, ctx
+        # gen (1.2.1): a generation cache, set by the core around a no-grad read. dict(n=positions cached, kv=[[K, V]] per
+        # block). n == 0: seq is a whole window (prefill); n > 0: seq is the one new token, at position n.
+        self.gen = None
+        # ckpt (Nov 15, memory): MPS materialises each block's T x T attention (~117 MB a block at 768 x 12, T 1024), so
+        # the 768 learner can't learn live on an 8 GB Mac. Recomputing blocks in backward holds one block's at a time.
+        # Same math; costs one more forward of the blocks.
+        self.ckpt = False
+
+    def forward(self, win, feat):
+        if self.gen is not None and not torch.is_grad_enabled():
+            return self._forward_gen(feat)
+        C, T = feat.shape[0], self.seq.shape[0]
+        x = (self.emb(self.seq) + self.pos(torch.arange(T, device=self.seq.device)))[None]   # (1, T, H)
+        f = feat.reshape(C, -1)
+        if self.past_on:                                                      # the earlier positions' own reads
+            self.feat_now = f.detach()
+            pu = self.past_use
+            pu = f.new_zeros(T - C, f.shape[1]) if pu is None else pu
+            if pu.shape[0] < T - C:
+                pu = torch.cat([f.new_zeros(T - C - pu.shape[0], f.shape[1]), pu], 0)
+            f, C = torch.cat([pu[pu.shape[0] - (T - C):], f], 0), T
+        inj = self.cell(self.ln(f))                                                      # (C, H): the store
+        if self.fmlp is not None:
+            inj = inj + self.fmlp(inj)
+        x = torch.cat([x[:, :T - C], x[:, T - C:] + inj[None]], 1)
+        ck = self.ckpt and torch.is_grad_enabled()                            # att_ckpt: recompute each block in backward
+        for i, b in enumerate(self.blocks):
+            if i and self.inject.startswith("every"):                         # the store again at every block
+                x = torch.cat([x[:, :T - C], x[:, T - C:] + inj[None]], 1)
+            x = torch.utils.checkpoint.checkpoint(b, x, use_reentrant=False) if ck else b(x)
+        C = feat.shape[0]
+        h = self.ln_f(x[0, T - C:])
+        if self.keep_h and h.requires_grad:
+            h.retain_grad()
+            self.h = h
+        return self.out(h)
+
+
+def _gen_forward(self, feat):
+    """Learner3 with a KV cache: the same window as a full forward, positions computed once (exact up to float order)."""
+    g = self.gen
+    assert not self.past_on, "generation cache: att_past is not supported"
+    C, n, Tn = feat.shape[0], g["n"], self.seq.shape[0]
+    x = (self.emb(self.seq) + self.pos(torch.arange(n, n + Tn, device=self.seq.device)))[None]
+    inj = self.cell(self.ln(feat.reshape(C, -1)))
+    if self.fmlp is not None:
+        inj = inj + self.fmlp(inj)
+    x = torch.cat([x[:, :Tn - C], x[:, Tn - C:] + inj[None]], 1)
+    if not g["kv"]:
+        g["kv"] = [[None, None] for _ in self.blocks]
+    for i, b in enumerate(self.blocks):
+        if i and self.inject.startswith("every"):
+            x = torch.cat([x[:, :Tn - C], x[:, Tn - C:] + inj[None]], 1)
+        x = b.forward_kv(x, g["kv"][i])
+    g["n"] = n + Tn
+    return self.out(self.ln_f(x[0, Tn - C:]))
+
+
+Learner3._forward_gen = _gen_forward
 
 
 class Learner2(torch.nn.Module):
@@ -77,8 +203,18 @@ class Core2(_Core):
     def __init__(self, cfg: dict, dev, blen: np.ndarray):
         super().__init__(cfg, dev, blen, parity=False)
         c = self.c
-        self.net = Learner2(self.V, int(c["window"]), int(c["emb"]), int(c["hidden"]), int(c["proj"]), self.O,
-                            self.NB, depth=int(c.get("depth", 1)), final_norm=int(c.get("final_norm", 0))).to(self.dev)
+        if str(c.get("learner", "mlp")) == "attn":                         # dev: hidden is its width, depth its layers
+            self.net = Learner3(self.V, int(c["proj"]), self.O, self.NB, int(c["hidden"]), int(c.get("depth", 1)),
+                                int(c.get("att_heads", 6)), int(c.get("att_ctx", 1024)),
+                                inject=str(c.get("att_inject", "input")), past=int(c.get("att_past", 0))).to(self.dev)
+            ck = int(c.get("att_ckpt", 0))                                 # -1 auto: on for mps (8 GB Macs), off elsewhere
+            self.net.ckpt = bool(ck) if ck >= 0 else self.dev.type == "mps"
+            fk = int(c.get("att_kernel", 0))                               # -1 auto: the Metal flash kernel on mps
+            for b in self.net.blocks:
+                b.flash = (bool(fk) if fk >= 0 else self.dev.type == "mps") and self.dev.type == "mps"
+        else:
+            self.net = Learner2(self.V, int(c["window"]), int(c["emb"]), int(c["hidden"]), int(c["proj"]), self.O,
+                                self.NB, depth=int(c.get("depth", 1)), final_norm=int(c.get("final_norm", 0))).to(self.dev)
         self.opt = torch.optim.Adam(self.net.parameters(), lr=float(c["lr"]), fused=self.dev.type in ("mps", "cuda"))
         # the rung and match weights: SGD at mix_lr * C (core.py) takes one large step per tick and overshoots at
         # large ticks; Adam's step does not scale with the tick (mix_opt 'adam', lr mix_adam)
@@ -132,7 +268,7 @@ class Core2(_Core):
         C, V, NB, d = win.shape[0], self.V, self.NB, self.dev
         keep = 1.0 - self.ab                                             # (NB,)
         pos = torch.arange(C, device=d)
-        y = torch.from_numpy(ys).to(d)
+        y = self._dv(ys)
         with torch.no_grad():
             lag = (pos[:, None] - pos[None, :]).float()                  # i - j
             lower = (lag > 0).float()
@@ -143,18 +279,18 @@ class Core2(_Core):
             f0 = keep[None, :] ** (t0 - self.r0_t + pos.float())[:, None]                 # (C, NB)
             n0i = f0 * self.n0[None] + W0.sum(-1)                                        # (C, NB)
             # orders >= 1: merged counts per position
-            toks, vals, Ns = [], [], []
+            toks, vals, Ns, sidxs = [], [], [], []
             for k in self.orders:
                 idc = idt[k]
                 M = maps[k]                                                              # (C, K+1) tokens
                 fk = keep[None, :] ** (t0 + pos.float() - self.sl[k][idc].float())[:, None]
                 R = self.sc[k][idc] * fk[..., None]                                      # (C, NB, K+1)
-                g = torch.from_numpy(gid[k]).to(d)
+                g = self._dv(gid[k])
                 same = ((g[:, None] == g[None, :]) & (g[:, None] >= 0)).float()          # (C, C) [i, j]
                 Wk = W0 * same[:, None, :]                                               # (C, NB, C)
                 N = self.st[k][idc] * fk + Wk.sum(-1)
                 # in-tick successors already in the node's slot row go into that slot
-                hit = (M[:, :self.KK[k]] == y[:, None]) & (torch.from_numpy(maps[f"v{k}"]).to(d)[:, :self.KK[k]])
+                hit = (M[:, :self.KK[k]] == y[:, None]) & (self._dv(maps[f"v{k}"])[:, :self.KK[k]])
                 sidx = torch.where(hit.any(1), hit.float().argmax(1), torch.full_like(y, -1))   # (C,) per j
                 ins = (sidx >= 0).float()
                 R = R.scatter_add(2, sidx.clamp(min=0)[None, None, :].expand(C, NB, C), Wk * ins[None, None, :])
@@ -166,22 +302,11 @@ class Core2(_Core):
                 toks.append(torch.cat([M, y[None, :].expand(C, C)], 1))                  # (C, K+1+C)
                 vals.append(torch.cat([R, A], 2))                                        # (C, NB, K+1+C)
                 Ns.append(N)
+                sidxs.append(sidx)
             self._t('read:merge orders')
             # the chain's coefficients
-            hs, gs = [], []
-            last = (torch.arange(NB, device=d) == NB - 1)[None, :]
-            for k in range(len(self.orders)):
-                v, N = vals[k], Ns[k]
-                dist = (v > 0.05).sum(-1).float()
-                lost = torch.clamp(N - v.sum(-1), min=0.0)
-                # all-time rung: at least one type. Halving scales its counts, so after five halvings a pair seen once
-                # (1/32) falls under the 0.05 type threshold; with no type the escape was exactly 0 and every other
-                # token read log 0 = -inf (Nov 8, James's run at 102M bytes). Equal to dist + (N == 0) everywhere else.
-                bt = torch.where(last, dist.clamp(min=1.0), dist + 1.0)
-                h = 1.0 / (N + bt)
-                hs.append(h)
-                gs.append((bt + lost) * h)
-            K = len(self.orders)
+            hs, gs = self._chain(vals, Ns)
+            K = self.KCH                                         # the back-off chain; skip orders sit after it
             # final level: p_K = G0 * p0 + sum_k coef_k c_k
             G0 = torch.ones(C, NB, device=d)
             coef = [None] * K
@@ -201,41 +326,42 @@ class Core2(_Core):
             LP = P.clamp_min_(1e-30).log_()                                             # never log 0
             deep = torch.stack([(n0i[:, -1] > 0).long() * 0] + [(Ns[k][:, -1] > 0).long() * (k + 1) for k in range(K)],
                                1).max(1).values
-            mpt = torch.from_numpy(mp).to(d)
-            mbt = torch.from_numpy(mb).to(d)
+            mpt = self._dv(mp)
+            mbt = self._dv(mb)
             hm = mpt >= 0
             bump = math.log(0.98 + 0.02 / V) - math.log(0.02 / V)
         # rungs mixed in log space: a batched mat-vec, not a broadcast; the match model's log-distribution is a
         # constant per row (cancelled by the softmax) plus a bump on the predicted token, so only the bump is added
         zE = torch.bmm(self.wE[deep][:, None, :], LP).squeeze(1)
-        zE = zE.index_put((torch.arange(C, device=d)[hm], mpt[hm]), (self.wM[deep, mbt] * bump)[hm], accumulate=True)
+        if d.type == "cuda":
+            # one add per row, at the predicted token; rows with no match add 0 at token 0. A boolean-mask index makes
+            # the CPU wait for the GPU to count the mask (Nov 10). Elsewhere the mask stays: on MPS that wait is what
+            # keeps two runs of the learner within 1e-7 of each other (without it they drift to 1e-5; cause unknown)
+            zE = zE.scatter_add(1, mpt.clamp(min=0)[:, None], (self.wM[deep, mbt] * (bump * hm.float()))[:, None])
+        else:
+            zE = zE.index_put((torch.arange(C, device=d)[hm], mpt[hm]), (self.wM[deep, mbt] * bump)[hm], accumulate=True)
         lpE = torch.log_softmax(zE, -1)
         self._t('read:log + exact mix')
         # ---- the learner's features: P^T p_L for every level L, exactly, from the same decomposition ----
-        def features(ix):
-            """the learner's features for rows ix (None: every row), exactly, from the same decomposition."""
-            sel = (lambda t: t) if ix is None else (lambda t: t[ix])
-            n = C if ix is None else len(ix)
-            Pm = self.net.P                                                              # (V, DP)
-            X0 = (sel(f0)[..., None] * (self.r0 @ Pm)[None] + Pm.sum(0) / V
-                  + torch.einsum("ibj,jd->ibd", sel(W0), Pm.index_select(0, y))) / (sel(n0i) + 1.0)[..., None]   # (n, NB, DP)
-            # index_select, not Pm[...]: same maths, but its backward is an index_add, not a sort (half of CUDA time, Nov 9)
-            Xs = [torch.einsum("ibt,itd->ibd", sel(vals[k]), Pm.index_select(0, sel(toks[k]).reshape(-1)).reshape(*sel(toks[k]).shape, Pm.shape[1]))
-                  for k in range(K)]
-            fs = [torch.cat([X0, torch.log1p(sel(n0i))[..., None]], -1)]
-            for L in range(1, K + 1):
-                run = torch.ones(n, NB, device=d)
-                acc = 0.0
-                for k in range(L - 1, -1, -1):
-                    acc = acc + (sel(hs[k]) * run)[..., None] * Xs[k]
-                    run = run * sel(gs[k])
-                acc = acc + run[..., None] * X0
-                fs.append(torch.cat([acc, torch.log1p(sel(Ns[L - 1]))[..., None]], -1))
-            return torch.stack(fs, 1)                                                    # (n, O, NB, DP+1)
-
-        wt = torch.from_numpy(win).to(d)
+        # everything the features need, as read before this tick's store update: rehearsal replays it (core3)
+        pk = dict(f0=f0, W0=W0, n0i=n0i, y=y, vals=vals, toks=toks, hs=hs, gs=gs, Ns=Ns, K=K, C=C, S=len(self.orders) - K,
+                  r0=self.r0.clone() if int(self.c.get("rehearse", 0)) else self.r0)
+        features = lambda ix: self._feat(pk, ix)
+        wt = self._dv(win)
         self._sel_lp = None
-        if rows is None:
+        self._lpL_train = None
+        loo = getattr(self, "_loo", None) if grad else None
+        if loo is not None:                                # a repeat pass: the learner trains on the leave-one-out read
+            assert rows is None, "leave-one-out reads are not combined with decimation by prediction"
+            with torch.no_grad():
+                pk_loo = self._loo_pack(pk, sidxs, loo)
+            with torch.no_grad():                          # the honest read scores the token and drives the mix
+                keep_h, self.net.keep_h = self.net.keep_h, False
+                lpL = torch.log_softmax(self._learner(wt, features(None)), -1)
+                self.net.keep_h = keep_h
+            self._lpL_train = torch.log_softmax(self._learner(wt, self._feat(pk_loo, None)), -1)
+            self._t('learner fwd')
+        elif rows is None:
             with torch.set_grad_enabled(grad):
                 feat = features(None)
                 self._t('read:features')
@@ -256,9 +382,90 @@ class Core2(_Core):
         with torch.no_grad():
             ent = -(lpE.exp() * lpE).sum(-1) / math.log(2)
             key = (deep * LB + mbt) * NE + torch.bucketize(ent, self.edges)
+        if grad and int(self.c.get("rehearse", 0)):
+            pk["wt"] = wt
+            self._pack = pk
         if getattr(self, 'probe', None) is not None:          # instruments only (tests/receipts.py); read, never written
             self._pr = dict(LP=LP, feat=feat.detach(), wt=wt, deep=deep, mpt=mpt, mbt=mbt, hm=hm, bump=bump)
         return lpE, lpL, key, deep
+
+    def _chain(self, vals, Ns):
+        """the chain's escape (g) and level (h) coefficients per order, from merged counts."""
+        NB, d = self.NB, self.dev
+        hs, gs = [], []
+        last = (torch.arange(NB, device=d) == NB - 1)[None, :]
+        for k in range(len(vals)):
+            v, N = vals[k], Ns[k]
+            dist = (v > 0.05).sum(-1).float()
+            lost = torch.clamp(N - v.sum(-1), min=0.0)
+            # all-time rung: at least one type. Halving scales its counts, so after five halvings a pair seen once
+            # (1/32) falls under the 0.05 type threshold; with no type the escape was exactly 0 and every other
+            # token read log 0 = -inf (Nov 8, James's run at 102M bytes). Equal to dist + (N == 0) everywhere else.
+            bt = torch.where(last, dist.clamp(min=1.0), dist + 1.0)
+            h = 1.0 / (N + bt)
+            hs.append(h)
+            gs.append((bt + lost) * h)
+        return hs, gs
+
+    def _loo_pack(self, pk, sidxs, loo):
+        """the leave-one-out read (LOO_SPEC.md; James's yes, Nov 10): the same read with this position's own earlier
+        instances removed. loo (NB,) is what those instances weigh now on each rung; a removal never takes a count
+        below zero. Pair slot and node total per order, and the order-0 count; the chain follows from the reduced counts."""
+        C, NB, d = pk["C"], self.NB, self.dev
+        ix = torch.arange(C, device=d)
+        vals, Ns = [], []
+        for k in range(pk["K"]):
+            v = pk["vals"][k].clone(); s_ = sidxs[k]; found = (s_ >= 0).float()[:, None]
+            col = s_.clamp(min=0)
+            cur = v[ix, :, col]                                                       # (C, NB): the target's slot
+            sub = torch.minimum(cur, loo[None, :]) * found
+            v[ix, :, col] = cur - sub
+            vals.append(v); Ns.append((pk["Ns"][k] - sub).clamp(min=0.0))
+        r0y = (pk["f0"] * pk["r0"].index_select(1, pk["y"]).T)                         # (C, NB): the target's order-0 count
+        d0 = torch.minimum(r0y, loo[None, :])
+        hs, gs = self._chain(vals, Ns)
+        return dict(pk, vals=vals, Ns=Ns, hs=hs, gs=gs, n0i=(pk["n0i"] - d0).clamp(min=0.0), d0=d0)
+
+    def _succ(self, v, t, Pm):
+        """sum_t v[i,b,t] * Pm[tok[i,t]] -> (n, NB, DP). Gathering a projection row per successor slot costs n*T*DP floats
+        (1.07 GiB a tick at order 1 with K=2048, DP=256: OOM on an 8 GB Mac, Nov 15); scattering the counts onto the vocabulary
+        and doing one matmul costs n*NB*V. Same sum, different float order; take whichever is smaller."""
+        n, NB, T = v.shape
+        V, DP = Pm.shape
+        if T * DP <= NB * V or not int(self.c.get("feat_scatter", 1)):
+            return torch.einsum("ibt,itd->ibd", v, Pm.index_select(0, t.reshape(-1)).reshape(n, T, DP))
+        A = torch.zeros(n, NB, V, device=v.device, dtype=v.dtype)
+        A.scatter_add_(2, t[:, None, :].expand(n, NB, T), v)
+        return A @ Pm
+
+    def _feat(self, pk, ix):
+        """the learner's features for rows ix (None: every row), exactly, from the read's decomposition (a pack)."""
+        f0, W0, n0i, y, vals, toks, hs, gs, Ns, K, C = (pk[k] for k in ("f0", "W0", "n0i", "y", "vals", "toks", "hs", "gs", "Ns", "K", "C"))
+        NB, d, V = self.NB, self.dev, self.V
+        sel = (lambda t: t) if ix is None else (lambda t: t[ix])
+        n = C if ix is None else len(ix)
+        Pm = self.net.P                                                              # (V, DP)
+        X0 = (sel(f0)[..., None] * (pk["r0"] @ Pm)[None] + Pm.sum(0) / V
+              + torch.einsum("ibj,jd->ibd", sel(W0), Pm.index_select(0, y))) / (sel(n0i) + 1.0)[..., None]   # (n, NB, DP)
+        if "d0" in pk:                                     # leave-one-out: this instance's order-0 count removed
+            X0 = X0 - (sel(pk["d0"])[..., None] * sel(Pm.index_select(0, y))[:, None, :]) / (sel(n0i) + 1.0)[..., None]
+        # index_select, not Pm[...]: same maths, but its backward is an index_add, not a sort (half of CUDA time, Nov 9)
+        Xs = [self._succ(sel(vals[k]), sel(toks[k]), Pm)
+              for k in range(K)]
+        fs = [torch.cat([X0, torch.log1p(sel(n0i))[..., None]], -1)]
+        for L in range(1, K + 1):
+            run = torch.ones(n, NB, device=d)
+            acc = 0.0
+            for k in range(L - 1, -1, -1):
+                acc = acc + (sel(hs[k]) * run)[..., None] * Xs[k]
+                run = run * sel(gs[k])
+            acc = acc + run[..., None] * X0
+            fs.append(torch.cat([acc, torch.log1p(sel(Ns[L - 1]))[..., None]], -1))
+        for k in range(K, K + pk.get("S", 0)):            # skip orders: their own level, backed off to order 0
+            Xk = self._succ(sel(vals[k]), sel(toks[k]), Pm)
+            acc = sel(hs[k])[..., None] * Xk + sel(gs[k])[..., None] * X0
+            fs.append(torch.cat([acc, torch.log1p(sel(Ns[k]))[..., None]], -1))
+        return torch.stack(fs, 1)                                                    # (n, O, NB, DP+1)
 
     def _learner(self, wt, feat):
         """the learner's logits (fp32); on cuda with learner_bf16 its matmuls run in bf16 autocast."""

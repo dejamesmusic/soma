@@ -18,7 +18,7 @@ if __package__ in (None, ""):
 
 import dataclasses
 
-from somatic_core.runtime import SOMA, CoreConfig
+from somatic_core.runtime import IDENTITY, SOMA, CoreConfig
 
 
 def emit(kind, payload=None):
@@ -199,23 +199,30 @@ class Worker:
 
     # what a run may set: a new model takes every CoreConfig field the run names; a continuation keeps its identity
     # (a different one is refused by the runtime) and takes the run's dynamics. anything the run leaves unset stays.
-    def requested_config(self, base):
+    def requested_config(self, base, continuation=False):
         values = base.public_dict()
         fields = {f.name: f for f in dataclasses.fields(CoreConfig)}
         given = dict(self.config)
         if "width" in given and str(given.get("hidden", "")).strip() == "":
             given["hidden"] = given["width"]                     # logOS's cloud agent names the learner width 'width'
+        kept = {}
         for key, value in given.items():
             if key in fields and str(value).strip() != "":
                 kind = type(values[key])
-                values[key] = (str(value).lower() in ("1", "true", "yes")) if kind is bool else kind(value)
+                v = (str(value).lower() in ("1", "true", "yes")) if kind is bool else kind(value)
+                if continuation and key in IDENTITY and v != values[key]:
+                    kept[key] = (values[key], v)                 # 1.2.0: a saved model keeps its shape (the form's
+                    continue                                     # shape fields describe new models; old sidecars lack some)
+                values[key] = v
+        if kept:
+            self.event("identity_kept", {k: {"model": a, "form": b} for k, (a, b) in kept.items()})
         return CoreConfig(**values).validate()
 
     def build_model(self):
         checkpoint = str(self.config.get("checkpoint", "")).strip()
         if checkpoint:
             model = SOMA.from_checkpoint(checkpoint, device=self.config.get("device", "auto"))
-            model.reconfigure_dynamics(self.requested_config(model.config))
+            model.reconfigure_dynamics(self.requested_config(model.config, continuation=True))
             if self.config.get("fork", False) in (True, "true", "True", 1, "1"):
                 self.event("saving", self.config["save_path"])
                 model.save_fork(self.config["save_path"])

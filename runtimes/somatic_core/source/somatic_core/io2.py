@@ -47,6 +47,7 @@ class IO2:
         self.actuations = 0
         self.stride_ = 1
         self.lr_ = self.lr_base
+        self.project_on_device = True          # cuda: see advance(); False restores the host product (a diagnostic)
 
     # ---- the bank ----
     def _sampling_gain(self, s):
@@ -67,7 +68,7 @@ class IO2:
 
     def advance(self, values: torch.Tensor, gaps):
         """values (n, dim) in time order; gaps (n,) tokens elapsed before each (decay first, then inject)."""
-        v = values.detach().float().cpu().double()
+        v = values.detach()
         if not len(v):
             return
         g = torch.as_tensor(gaps, dtype=torch.float64).clamp_min(1.0)
@@ -76,7 +77,13 @@ class IO2:
         s = max(1, int(round(float(g.mean()))))
         inj = (1.0 - self.retention) * self._sampling_gain(s)
         coef = inj[None] * self.retention[None] ** rem[:, None]                      # (n, k+1)
-        self.trace.mul_((self.retention ** cum[-1])[:, None]).add_(coef.T @ v)
+        if v.device.type == "cuda" and self.project_on_device:
+            # the same float64 product, formed on the GPU: (k+1, dim) crosses to the host, not (n, dim). At width
+            # 4096 the host copy and product were 11 ms of every tick with the GPU idle (Nov 10)
+            add = (coef.T.to(v.device) @ v.double()).cpu()
+        else:
+            add = coef.T @ v.float().cpu().double()
+        self.trace.mul_((self.retention ** cum[-1])[:, None]).add_(add)
         a = torch.linalg.vector_norm(self.trace[:-1] - self.trace[1:], dim=1) * self._calibration(s)
         tot = float(a.sum())
         if tot <= EPS:
