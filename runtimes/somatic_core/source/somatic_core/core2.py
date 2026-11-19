@@ -47,6 +47,19 @@ class Block(torch.nn.Module):
         return h + self.down(torch.nn.functional.gelu(self.up(self.ln(h))))
 
 
+def _rot(x, cos, sin):
+    """rotary positions (att_rope): x (B, h, T, d) turned by its position's angles; cos/sin (T, d/2)."""
+    h = x.shape[-1] // 2
+    x1, x2 = x[..., :h], x[..., h:]
+    return torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], -1)
+
+
+def _rope_table(n, d, device):
+    inv = 1.0 / (10000.0 ** (torch.arange(0, d // 2, device=device).float() * 2 / d))
+    a = torch.arange(n, device=device).float()[:, None] * inv[None]
+    return a.cos(), a.sin()
+
+
 class AttnBlock(torch.nn.Module):
     """a pre-LayerNorm causal self-attention block with a GELU MLP (GPT-2 form)."""
     def __init__(self, H, heads, L):
@@ -58,9 +71,11 @@ class AttnBlock(torch.nn.Module):
         for m, sd in ((self.qkv, 0.02), (self.f1, 0.02), (self.o, 0.02 / (2 * L) ** 0.5), (self.f2, 0.02 / (2 * L) ** 0.5)):
             torch.nn.init.normal_(m.weight, 0.0, sd); torch.nn.init.zeros_(m.bias)
 
-    def forward(self, x):                                                    # (1, T, H)
+    def forward(self, x, cos=None, sin=None):                                # (1, T, H)
         B, T, H = x.shape
         q, k, v = self.qkv(self.l1(x)).view(B, T, 3, self.heads, H // self.heads).permute(2, 0, 3, 1, 4)
+        if cos is not None:
+            q, k = _rot(q, cos[:T], sin[:T]), _rot(k, cos[:T], sin[:T])
         if self.flash and flash_mps.supported(q):                          # 1.2.1: no T x T is ever stored
             a = flash_mps.FlashAttn.apply(q, k, v).transpose(1, 2).reshape(B, T, H)
         else:
@@ -68,16 +83,42 @@ class AttnBlock(torch.nn.Module):
         x = x + self.o(a)
         return x + self.f2(torch.nn.functional.gelu(self.f1(self.l2(x))))
 
-    def forward_kv(self, x, kv):
-        """generation (1.2.1): x holds new positions only; kv = [K, V] of the earlier ones (grown in place)."""
+    def forward_cache(self, x, ck, cv, cos, sin, win=0):
+        """att_cache (Nov 18; James: "the store/count/window all observe the same now"): x holds only this tick's
+        positions; ck/cv are the earlier positions' keys (un-rotated) and values, computed once, at their own tick, and
+        read here without recomputation or gradient. Returns x and this tick's own keys/values for the cache."""
+        B, C, H = x.shape
+        q, k, v = self.qkv(self.l1(x)).view(B, C, 3, self.heads, H // self.heads).permute(2, 0, 3, 1, 4)
+        Lc = 0 if ck is None else ck.shape[2]
+        T = Lc + C
+        ka = k if ck is None else torch.cat([ck.to(k.dtype), k], 2)                 # a prefilled cache may be fp32 under bf16
+        va = v if cv is None else torch.cat([cv.to(v.dtype), v], 2)
+        qr, kr = _rot(q, cos[Lc:T], sin[Lc:T]), _rot(ka, cos[:T], sin[:T])        # relative: only distances matter
+        if Lc == 0 and not (win and C > win):
+            a = torch.nn.functional.scaled_dot_product_attention(qr, kr, va, is_causal=True)
+        else:                                                                 # query i sees the past and new j <= i
+            qi = (Lc + torch.arange(C, device=x.device))[:, None]
+            kj = torch.arange(T, device=x.device)[None, :]
+            m = (kj <= qi) & (kj > qi - win) if win else kj <= qi              # win: exactly win positions per query
+            a = torch.nn.functional.scaled_dot_product_attention(qr, kr, va, attn_mask=m)
+        x = x + self.o(a.transpose(1, 2).reshape(B, C, H))
+        return x + self.f2(torch.nn.functional.gelu(self.f1(self.l2(x)))), k, v
+
+    def forward_kv(self, x, kv, cos=None, sin=None, n=0, win=0):
+        """generation (1.2.1): x holds new positions only; kv = [K, V] of the earlier ones (grown in place). win (slide):
+        the cache keeps the last win positions, so each new query reads exactly win, itself included."""
         B, T, H = x.shape
         q, k, v = self.qkv(self.l1(x)).view(B, T, 3, self.heads, H // self.heads).permute(2, 0, 3, 1, 4)
+        if cos is not None:                                                   # rotary: cached keys keep their angles
+            q, k = _rot(q, cos[n:n + T], sin[n:n + T]), _rot(k, cos[n:n + T], sin[n:n + T])
         if kv[0] is None:
             kv[0], kv[1] = k, v
             a = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
         else:
-            kv[0], kv[1] = torch.cat([kv[0], k], 2), torch.cat([kv[1], v], 2)
+            kv[0], kv[1] = torch.cat([kv[0].to(k.dtype), k], 2), torch.cat([kv[1].to(v.dtype), v], 2)
             assert T == 1, "one new position at a time"
+            if win and kv[0].shape[2] > win:                                  # rotated keys: trimming keeps distances
+                kv[0], kv[1] = kv[0][:, :, -win:], kv[1][:, :, -win:]
             a = torch.nn.functional.scaled_dot_product_attention(q, kv[0], kv[1])
         x = x + self.o(a.transpose(1, 2).reshape(B, T, H))
         return x + self.f2(torch.nn.functional.gelu(self.f1(self.l2(x))))
@@ -88,15 +129,27 @@ class Learner3(torch.nn.Module):
     a richer picture"). A causal transformer over the last `ctx` exact tokens of the stream (read from the matcher's
     ring: nothing new is stored), with the store's features for each new position added to its input. The core sets
     `seq` before each call: the earlier tokens, then the inputs of the C positions being predicted."""
-    def __init__(self, V, DP, O, NB, H, L, heads, ctx, inject="input", past=0):
+    def __init__(self, V, DP, O, NB, H, L, heads, ctx, inject="input", past=0, rope=0):
         super().__init__()
+        # rope (Nov 18): rotary positions instead of a learned absolute table, so a key keeps its meaning as the window
+        # slides; required by the cached past (att_cache), where earlier keys are not recomputed
+        self.rope = bool(rope)
         # past=1 (dev, Nov 11; James: does attention run over every layer?): the window's earlier positions carry the
         # store reads made when they were predicted (core3 keeps them, bounded to ctx - C rows), so every layer sees
         # the store at every position, not only at the tick's own. Honest: each read is from its own time.
         self.past_on, self.past_use, self.feat_now = bool(past), None, None
         self.inject = inject                                                   # "input" | "every" (each block's input)
-        self.emb = torch.nn.Embedding(V, H); self.pos = torch.nn.Embedding(ctx, H)
-        torch.nn.init.normal_(self.emb.weight, 0.0, 0.02); torch.nn.init.normal_(self.pos.weight, 0.0, 0.02)
+        self.emb = torch.nn.Embedding(V, H); torch.nn.init.normal_(self.emb.weight, 0.0, 0.02)
+        if self.rope:
+            self.pos = None
+            cos, sin = _rope_table(2 * ctx, H // heads, "cpu")
+            self.register_buffer("rcos", cos, persistent=False); self.register_buffer("rsin", sin, persistent=False)
+        else:
+            self.pos = torch.nn.Embedding(ctx, H); torch.nn.init.normal_(self.pos.weight, 0.0, 0.02)
+        # the cached past (att_cache): the core sets cache_in = [(K, V)] per block (or None) before a tick; the forward
+        # leaves this tick's own (K, V) in cache_out
+        self.cache_on, self.cache_in, self.cache_out = False, None, None
+        self.slide = 0             # att_cache=2: every position reads exactly ctx positions (itself included), any tick length
         self.P = torch.nn.Parameter(torch.randn(V, DP) * 0.5)
         self.ln = torch.nn.LayerNorm(O * NB * (DP + 1))
         self.cell = torch.nn.Linear(O * NB * (DP + 1), H, bias=False)
@@ -118,8 +171,12 @@ class Learner3(torch.nn.Module):
     def forward(self, win, feat):
         if self.gen is not None and not torch.is_grad_enabled():
             return self._forward_gen(feat)
+        if self.cache_on:
+            return self._forward_cached(feat)
         C, T = feat.shape[0], self.seq.shape[0]
-        x = (self.emb(self.seq) + self.pos(torch.arange(T, device=self.seq.device)))[None]   # (1, T, H)
+        x = self.emb(self.seq)[None] if self.rope else \
+            (self.emb(self.seq) + self.pos(torch.arange(T, device=self.seq.device)))[None]     # (1, T, H)
+        rc = (self.rcos, self.rsin) if self.rope else ()
         f = feat.reshape(C, -1)
         if self.past_on:                                                      # the earlier positions' own reads
             self.feat_now = f.detach()
@@ -136,7 +193,7 @@ class Learner3(torch.nn.Module):
         for i, b in enumerate(self.blocks):
             if i and self.inject.startswith("every"):                         # the store again at every block
                 x = torch.cat([x[:, :T - C], x[:, T - C:] + inj[None]], 1)
-            x = torch.utils.checkpoint.checkpoint(b, x, use_reentrant=False) if ck else b(x)
+            x = torch.utils.checkpoint.checkpoint(b, x, *rc, use_reentrant=False) if ck else b(x, *rc)
         C = feat.shape[0]
         h = self.ln_f(x[0, T - C:])
         if self.keep_h and h.requires_grad:
@@ -144,13 +201,56 @@ class Learner3(torch.nn.Module):
             self.h = h
         return self.out(h)
 
+    def _forward_cached(self, feat):
+        """seq holds this tick's C inputs only; the earlier positions come from cache_in."""
+        C = feat.shape[0]
+        need = C + (self.cache_in[0][0].shape[2] if self.cache_in else 0)
+        if need > self.rcos.shape[0]:
+            self.rcos, self.rsin = _rope_table(2 * need, self.rcos.shape[1] * 2, self.rcos.device)
+        assert self.seq.shape[0] == C and self.rope and not self.past_on
+        inj = self.cell(self.ln(feat.reshape(C, -1)))
+        if self.fmlp is not None:
+            inj = inj + self.fmlp(inj)
+        x = self.emb(self.seq)[None] + inj[None]
+        ck = self.ckpt and torch.is_grad_enabled()
+        out = []
+        for i, b in enumerate(self.blocks):
+            if i and self.inject.startswith("every"):
+                x = x + inj[None]
+            kv = self.cache_in[i] if self.cache_in else (None, None)
+            if ck:
+                x, k, v = torch.utils.checkpoint.checkpoint(b.forward_cache, x, kv[0], kv[1], self.rcos, self.rsin,
+                                                            self.slide, use_reentrant=False)
+            else:
+                x, k, v = b.forward_cache(x, kv[0], kv[1], self.rcos, self.rsin, self.slide)
+            out.append((k.detach(), v.detach()))
+        self.cache_out = out
+        h = self.ln_f(x[0])
+        if self.keep_h and h.requires_grad:
+            h.retain_grad()
+            self.h = h
+        return self.out(h)
+
+    @torch.no_grad()
+    def prefill(self, seq):
+        """the cached past rebuilt from tokens alone (a resumed or broken stream): one causal pass with today's weights
+        and no store reads, as the uncached window treats its earlier positions."""
+        x = self.emb(seq)[None]
+        out = []
+        for b in self.blocks:
+            x, k, v = b.forward_cache(x, None, None, self.rcos, self.rsin)
+            out.append((k, v))
+        return out
+
 
 def _gen_forward(self, feat):
     """Learner3 with a KV cache: the same window as a full forward, positions computed once (exact up to float order)."""
     g = self.gen
     assert not self.past_on, "generation cache: att_past is not supported"
     C, n, Tn = feat.shape[0], g["n"], self.seq.shape[0]
-    x = (self.emb(self.seq) + self.pos(torch.arange(n, n + Tn, device=self.seq.device)))[None]
+    x = self.emb(self.seq)[None] if self.rope else \
+        (self.emb(self.seq) + self.pos(torch.arange(n, n + Tn, device=self.seq.device)))[None]
+    rc = dict(cos=self.rcos, sin=self.rsin, n=n) if self.rope else {}
     inj = self.cell(self.ln(feat.reshape(C, -1)))
     if self.fmlp is not None:
         inj = inj + self.fmlp(inj)
@@ -160,7 +260,7 @@ def _gen_forward(self, feat):
     for i, b in enumerate(self.blocks):
         if i and self.inject.startswith("every"):
             x = torch.cat([x[:, :Tn - C], x[:, Tn - C:] + inj[None]], 1)
-        x = b.forward_kv(x, g["kv"][i])
+        x = b.forward_kv(x, g["kv"][i], win=self.slide, **rc)
     g["n"] = n + Tn
     return self.out(self.ln_f(x[0, Tn - C:]))
 
@@ -206,7 +306,11 @@ class Core2(_Core):
         if str(c.get("learner", "mlp")) == "attn":                         # dev: hidden is its width, depth its layers
             self.net = Learner3(self.V, int(c["proj"]), self.O, self.NB, int(c["hidden"]), int(c.get("depth", 1)),
                                 int(c.get("att_heads", 6)), int(c.get("att_ctx", 1024)),
-                                inject=str(c.get("att_inject", "input")), past=int(c.get("att_past", 0))).to(self.dev)
+                                inject=str(c.get("att_inject", "input")), past=int(c.get("att_past", 0)),
+                                rope=int(c.get("att_rope", 0))).to(self.dev)
+            self.net.cache_on = bool(int(c.get("att_cache", 0)))
+            self.net.slide = int(c.get("att_ctx", 1024)) if int(c.get("att_cache", 0)) == 2 else 0
+            assert not self.net.cache_on or (self.net.rope and not self.net.past_on), "att_cache needs att_rope, not att_past"
             ck = int(c.get("att_ckpt", 0))                                 # -1 auto: on for mps (8 GB Macs), off elsewhere
             self.net.ckpt = bool(ck) if ck >= 0 else self.dev.type == "mps"
             fk = int(c.get("att_kernel", 0))                               # -1 auto: the Metal flash kernel on mps
@@ -234,8 +338,11 @@ class Core2(_Core):
         if self._prof is None:
             return
         import time as _time
-        torch.mps.synchronize() if self.dev.type == "mps" else None
+        torch.mps.synchronize() if self.dev.type == "mps" else (torch.cuda.synchronize() if self.dev.type == "cuda" else None)
         now = _time.perf_counter()
+        if self.dev.type == "cuda" and getattr(self, "_prof_mem", None) is not None:   # peak memory per section (GB)
+            self._prof_mem[name] = max(self._prof_mem.get(name, 0.0), torch.cuda.max_memory_allocated() / 2**30)
+            torch.cuda.reset_peak_memory_stats()
         last = self._prof.get("_last")
         if last is not None:
             self._prof[name] = self._prof.get(name, 0.0) + now - last
@@ -283,7 +390,9 @@ class Core2(_Core):
             for k in self.orders:
                 idc = idt[k]
                 M = maps[k]                                                              # (C, K+1) tokens
-                fk = keep[None, :] ** (t0 + pos.float() - self.sl[k][idc].float())[:, None]
+                # ages from integer clocks first: float32 stamps near 2^30 are 64 tokens apart (the fast rungs' whole
+                # range), so subtracting after the cast rounded ages away (assessment, Nov 19; fixed in 1.4.0)
+                fk = keep[None, :] ** ((t0 - self.sl[k][idc]).float() + pos.float())[:, None]
                 R = self.sc[k][idc] * fk[..., None]                                      # (C, NB, K+1)
                 g = self._dv(gid[k])
                 same = ((g[:, None] == g[None, :]) & (g[:, None] >= 0)).float()          # (C, C) [i, j]
@@ -342,6 +451,11 @@ class Core2(_Core):
             zE = zE.index_put((torch.arange(C, device=d)[hm], mpt[hm]), (self.wM[deep, mbt] * bump)[hm], accumulate=True)
         lpE = torch.log_softmax(zE, -1)
         self._t('read:log + exact mix')
+        if getattr(self, "_count_only", False):            # the counting pass: the store's own read, no learner
+            with torch.no_grad():
+                ent = -(lpE.exp() * lpE).sum(-1) / math.log(2)
+                key = (deep * LB + mbt) * NE + torch.bucketize(ent, self.edges)
+            return lpE, lpE.detach(), key, deep
         # ---- the learner's features: P^T p_L for every level L, exactly, from the same decomposition ----
         # everything the features need, as read before this tick's store update: rehearsal replays it (core3)
         pk = dict(f0=f0, W0=W0, n0i=n0i, y=y, vals=vals, toks=toks, hs=hs, gs=gs, Ns=Ns, K=K, C=C, S=len(self.orders) - K,

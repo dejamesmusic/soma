@@ -18,9 +18,9 @@ import math
 import numpy as np
 import torch
 
-from .core2 import Core2, Learner3
+from .core2 import Core2, Learner3, _rot
 from .core import Matcher
-from . import bounds
+from . import bounds, jit
 
 
 class PairSlots:
@@ -376,6 +376,18 @@ class Core3(Core2):
 
     def _maps2(self, ids):
         out = {}
+        if jit.HAVE and all(type(self.slots[k]) is PagedPairSlots for k in self.orders):
+            for k in self.orders:                           # compiled, int32 across, widened on the device (Nov 18)
+                S = self.slots[k]
+                C = ids.shape[1]
+                M = np.empty((C, S.K + 1), np.int32)
+                Pm = np.empty((C, S.K + 1), np.int32)
+                jit.maps_tick(S.ptab, S.ptok, S.ppid, S.R, S.K, self.NPk[k], np.ascontiguousarray(ids[k - 1], np.int64), M, Pm)
+                Mt = self._dv(M).long()
+                out[f"v{k}"] = Mt >= 0
+                out[k] = Mt.clamp(min=0)
+                self._pidmap[k] = self._dv(Pm).long()
+            return out
         for k in self.orders:
             S = self.slots[k]
             n = ids[k - 1]
@@ -394,11 +406,15 @@ class Core3(Core2):
     def _node_pairs(self, k, nodes: np.ndarray):
         """flat pair ids of the given nodes and, for each, the index of its node in `nodes`."""
         S = self.slots[k]
+        if jit.HAVE and type(S) is PagedPairSlots:
+            return jit.node_pairs(S.ptab, S.ppid, S.R, np.ascontiguousarray(nodes, np.int64))
         P = S.rows(nodes)[1]
         r, cidx = np.nonzero(P >= 0)
         return P[r, cidx].astype(np.int64), r
 
     def _assign(self, ids, rec, ys):
+        if jit.HAVE and all(type(self.slots[k]) is PagedPairSlots for k in self.orders):
+            return self._assign_jit(ids, rec, ys)
         C = len(ys)
         slot, pair, new = {}, {}, {}
         for k in self.orders:
@@ -424,6 +440,33 @@ class Core3(Core2):
             slot[k], pair[k], new[k] = sk, pk, nk
         return slot, pair, new
 
+    def _assign_jit(self, ids, rec, ys):
+        """_assign on the compiled path (jit.assign_tick): the same slots, pairs and evictions, order by order"""
+        C = len(ys)
+        ys = np.ascontiguousarray(ys, np.int64)
+        ids = np.ascontiguousarray(ids, np.int64)
+        slot, pair, new = {}, {}, {}
+        nw = np.empty(C, np.int64)
+        for k in self.orders:
+            S = self.slots[k]
+            sk = np.full(C, S.K, np.int64)
+            pk = np.full(C, self.NPk[k], np.int64)
+            mt = np.array([S.nfree, S.overflows, S.trash, S.assignments, S.pair_evictions, S.page_fallbacks, S.npgfree],
+                          np.int64)
+            rng = jit.pcg_pack(S.rng.bit_generator.state)
+            rng0 = rng.copy()
+            ev = rec[k]
+            rp = np.array([e[0] for e in ev], np.int64)
+            rn = np.array([e[1] for e in ev], np.int64)
+            nn = jit.assign_tick(S.ptab, S.ptok, S.ppid, S.pgfree, S.pcnt, S.plast, S.pnode, S.pslot, S.free, mt, S.NG, S.R,
+                                 S.K, S.NP, S.lg, rng, ids[k - 1], ys, rp, rn, len(ev), self.chunks, sk, pk, nw)
+            S.nfree, S.overflows, S.trash, S.assignments, S.pair_evictions, S.page_fallbacks, S.npgfree = \
+                (int(v) for v in mt)
+            if not np.array_equal(rng, rng0):
+                S.rng.bit_generator.state = jit.pcg_unpack(rng)
+            slot[k], pair[k], new[k] = sk, pk, nw[:nn].tolist()
+        return slot, pair, new
+
     @torch.no_grad()
     def next_distribution(self, m: Matcher) -> torch.Tensor:
         """the next token's distribution in context m (chat, dreams). The attention learner reads m's own last tokens,
@@ -436,10 +479,29 @@ class Core3(Core2):
         ts, ctx = m.t, self.net.ctx
         ver = (id(self.net), self.chunks)
         g = getattr(m, "_gen", None)
-        if not (g is not None and g["ver"] == ver and ts == g["start"] + g["n"] + 1 and g["n"] < ctx):
-            L = max(1, min(ts, ctx - int(self.c["chunk"]) + 1))
-            seq = m.R[np.arange(ts - L, ts) % m.ring] if ts > 0 else np.zeros(1, np.int64)
-            g = dict(ver=ver, start=ts - L if ts > 0 else 0, n=0, kv=[])
+        # att_cache=2 (slide): a tick's every position reads exactly ctx positions through the cached past, so a
+        # generation window is the last ctx tokens and then slides (forward_kv trims), as training does. (Nov 18 fix:
+        # before this it anchored ctx - chunk + 1 positions, which is ONE token when chunk == ctx, and sampled from
+        # the last token alone.) Other modes keep the 1.2.1 geometry.
+        slide = int(getattr(self.net, "slide", 0) or 0)
+        if g is not None and g["ver"] == ver and g.get("p_ts") == ts and ts == g["start"] + g["n"]:
+            return g["p"]                            # this position is already read (a sample, then read() of its token)
+        room = (g["n"] + 1 < self.net.rcos.shape[0]) if (slide and g is not None and self.net.rope) else (g is not None and g["n"] < ctx)
+        if not (g is not None and g["ver"] == ver and ts == g["start"] + g["n"] + 1 and room):
+            kv0 = getattr(self, "_kv", None)
+            if slide and self.net.rope and kv0 is not None and self._kv_end == ts:
+                # the training window itself: its positions were computed with their store features at their own
+                # ticks (a window rebuilt from bare tokens is not what this learner was trained to read). Keys are
+                # cached un-rotated; generation's cache holds them rotated, at positions 0 .. Lk-1.
+                Lk = int(kv0[0][0].shape[2])
+                cs, sn = self.net.rcos[:Lk], self.net.rsin[:Lk]
+                g = dict(ver=ver, start=ts - 1 - Lk, n=Lk, kv=[[_rot(k, cs.to(k.dtype), sn.to(k.dtype)), v] for k, v in kv0])
+                seq = m.R[[(ts - 1) % m.ring]]
+            else:
+                L = max(1, min(ts, ctx)) if slide else max(1, min(ts, ctx - int(self.c["chunk"]) + 1))
+                seq = m.R[np.arange(ts - L, ts) % m.ring] if ts > 0 else np.zeros(1, np.int64)
+                g = dict(ver=ver, start=ts - L if ts > 0 else 0, n=0, kv=[])
+                self.gen_rebuilds = getattr(self, "gen_rebuilds", 0) + 1
             m._gen = g
         else:
             seq = m.R[[(ts - 1) % m.ring]]
@@ -447,23 +509,123 @@ class Core3(Core2):
         self.net.past_use = None
         self.net.gen = g
         try:
-            return super().next_distribution(m)
+            p = super().next_distribution(m)
+            g["p"], g["p_ts"] = p, ts
+            return p
         finally:
             self.net.gen = None
 
+    @torch.no_grad()
+    def read(self, m: Matcher, ys):
+        """tokens into a context the way generation will read them (Nov 18): with the attention learner's sliding
+        cache, each one passes through the learner with its store features, so the window a reply reads holds the
+        same kind of positions training made. Other learners: observe."""
+        if not (isinstance(self.net, Learner3) and int(getattr(self.net, "slide", 0) or 0)):
+            return self.observe(m, ys)
+        for y in np.asarray(ys, np.int64).reshape(-1):
+            self.next_distribution(m)
+            self.observe(m, [int(y)])
+
+    def count(self, m: Matcher, ys):
+        """the counting pass: the store (and its exact mix) advances exactly as step() would advance it, with no
+        learner read, gradient, gate or cache. The store is a function of the stream alone (checked Nov 18), so this
+        is how a far-apart lane is seeded with the stream's store at its offset."""
+        self._count_only = True
+        try:
+            return self.step(m, ys)
+        finally:
+            self._count_only = False
+
+    def _count_pure(self, ids, rec, ys, t0, C):
+        idt = self._idt(ids)
+        with torch.no_grad():                             # recycled nodes (and their pairs) read as empty this tick
+            for k in self.orders:
+                if rec[k]:
+                    nodes = np.array([n for _, n in rec[k]], np.int64)
+                    nd = self._dv(nodes)
+                    self.st[k].index_fill_(0, nd, 0.0)
+                    self.sl[k].index_fill_(0, nd, t0)
+                    pp, _ = self._node_pairs(k, nodes)
+                    if len(pp):
+                        self.pc[k].index_fill_(0, self._dv(pp), 0.0)
+        slot, pair, new = self._assign(ids, rec, ys)
+        self._t('cpu contexts')
+        self._store_update(ids, idt, pair, new, self._dv(ys), t0, C)
+        self._t('store update')
+        self.clock += C
+        self.chunks += 1
+        self.n0_all += C
+        if self.n0_all > float(self.c["alltime_cap"]):
+            self._halve()
+        if self.clock >= self.rebase_at:
+            self._rebase()
+        if self.chunks % 1024 == 0:
+            bounds.cap_steps_(self.mopt)
+        return None
+
+    def _store_update(self, ids, idt, pair, new, y, t0, C):
+        """the counts take this tick's tokens: decay to its end, add each position's successor (data only)"""
+        d = self.dev
+        with torch.no_grad():
+            keep = 1.0 - self.ab
+            te = t0 + C
+            wj = keep[None, :] ** (C - torch.arange(C, device=d).float())[:, None]
+            self.r0 *= (keep ** float(te - self.r0_t))[:, None]
+            self.n0 *= keep ** float(te - self.r0_t)
+            self.r0_t = te
+            NB = self.NB
+            ib = self.ar[None].expand(C, NB)
+            self.r0.index_put_((ib, y[:, None].expand(C, NB)), wj, accumulate=True)
+            self.n0 += wj.sum(0)
+            for k in self.orders:
+                if new[k]:
+                    self.pc[k].index_fill_(0, self._dv(np.asarray(new[k], np.int64)), 0.0)
+                idc = idt[k]
+                Un = np.unique(ids[k - 1])
+                Un = Un[Un >= 0]
+                U = self._dv(Un)
+                f = keep[None] ** (te - self.sl[k][U]).float()[:, None]                  # (|U|, NB)
+                pp, owner = self._node_pairs(k, Un)
+                if len(pp):
+                    self.pc[k][self._dv(pp)] *= f[self._dv(owner)]
+                self.st[k][U] *= f
+                self.sl[k].index_fill_(0, U, te)
+                pj = self._dv(pair[k])[:, None].expand(C, NB)
+                self.pc[k].index_put_((pj, ib), wj, accumulate=True)
+                ix = idc[:, None].expand(C, NB)
+                self.st[k].index_put_((ix, ib), wj, accumulate=True)
+                self.pc[k][self.NPk[k]].zero_()
+                self.st[k][self.PK[k]].zero_()
+
     def step(self, m: Matcher, ys, learn: bool = True):
+        cnt_ = getattr(self, "_count_only", False)
+        ms_ = int(self.c.get("mix_shared", 0))           # 1: mixer on the learner's update cadence; 2: per tick, as before
+        ms = ms_ == 1                                      # either way the mixer is not the store: count() leaves it alone
         ys = np.asarray(ys, np.int64)
         C = len(ys)
         d = self.dev
         t0 = self.clock
         self._t('_start')
         ids, rec, mp, mb, win = self._contexts(m, ys, learn)
-        if isinstance(self.net, Learner3):                 # the attention learner reads the stream's recent tokens
+        if cnt_ and ms_:                                     # the store is counts only: no read at all
+            return self._count_pure(ids, rec, ys, t0, C)
+        if isinstance(self.net, Learner3) and not cnt_:      # the attention learner reads the stream's recent tokens
             assert not isinstance(m, (list, tuple)), "the attention learner takes one stream"
             ts = m.t - C                                   # the clock of ys[0] in this context
             L = max(1, min(ts, self.net.ctx - C + 1))
             prev = m.R[np.arange(ts - L, ts) % m.ring] if ts > 0 else np.zeros(1, np.int64)
-            self.net.seq = self._dv(np.concatenate([prev, ys[:-1]]).astype(np.int64))
+            if self.net.cache_on:                          # the cached past: only this tick's inputs are computed
+                assert str(self.c.get("learn_mode", "skip")) in ("skip", "accumulate") and not int(self.c.get("rehearse", 0))
+                self.net.seq = self._dv(np.concatenate([prev[-1:], ys[:-1]]).astype(np.int64))
+                ok = getattr(self, "_kv", None) is not None and self._kv_end == ts
+                if not ok:                                 # first tick, a resume without one, or a gap: rebuild
+                    Lc = max(0, min(ts - 1, self.net.ctx - (1 if self.net.slide else C)))
+                    self._kv = self.net.prefill(self._dv(m.R[np.arange(ts - 1 - Lc, ts - 1) % m.ring].astype(np.int64))) \
+                        if Lc > 0 else None
+                    self.kv_rebuilds = getattr(self, "kv_rebuilds", 0) + 1
+                self.net.cache_in = self._kv
+            else:
+                self.net.seq = self._dv(np.concatenate([prev, ys[:-1]]).astype(np.int64))
             if self.net.past_on:                           # this stream's own earlier reads, if they end where we start
                 ok = learn and getattr(self, "_past", None) is not None and self._past_end == ts
                 self.net.past_use = self._past if ok else None
@@ -492,7 +654,7 @@ class Core3(Core2):
         #   io2         select, with s chosen by io2's decimation band (phi^band, dithered so the density is exact)
         mode = str(self.c.get("learn_mode", "skip"))
         sel_ = mode in ("select", "io2")
-        if learn:
+        if learn and not cnt_:
             self._io2_flush()                             # last tick's io2 host work: waits only on that tick's tail
         if sel_:
             s_, acc_ = (self._sel_stride(mode) if learn else 1), False
@@ -509,6 +671,11 @@ class Core3(Core2):
             upd = learn and self.chunks % s_ == s_ - 1
             lgrad = learn and (s_ == 1 or upd or acc_)
             rows, rows_np, nsel = None, None, C
+        assert not (ms and sel_), "mix_shared steps the mixer on the learner's tick cadence (skip/accumulate)"
+        if cnt_:
+            upd = lgrad = sel_ = acc_ = False
+        if getattr(self, "_ext", False):                  # a lane (lanes.py): gradients only; the shared update is
+            upd = False                                    # applied once per round by apply_update
         self.net.keep_h = lgrad and self.io2 is not None             # io2's residual comes from the backward pass
         self._loo = self._loo_delta(t0) if (lgrad and getattr(self, 'loo_ages', None)) else None
         lpE, lpL, key, deep = self._read2(idt, gid, maps, ys, mp, mb, win, t0, grad=lgrad, rows=rows)
@@ -525,12 +692,21 @@ class Core3(Core2):
             self.acc[5] += C
         self.last = dict(tokens=ys, bits=-torch.log2(pf), exact=-lyE.detach() / math.log(2), next=pfull[-1].topk(5),
                          learner=-lyL.detach() / math.log(2), deep=deep)          # deep: the store's deepest known order, per token
-        if getattr(self, 'probe', None) is not None:          # before any learning from this tick
+        if getattr(self, 'probe', None) is not None and not cnt_:   # before any learning from this tick
             self.probe(self, y, sg, lpE.detach(), lpL.detach())
         self._t('scoring')
         if not learn:
             return -torch.log2(pf)
-        if isinstance(self.net, Learner3) and self.net.past_on and self.net.feat_now is not None:
+        if isinstance(self.net, Learner3) and self.net.cache_on and self.net.cache_out is not None and not cnt_:
+            keep = self.net.ctx - (1 if self.net.slide else C)   # bounded: ctx positions in all (slide: per query)
+            ci, co = self.net.cache_in, self.net.cache_out
+            kv = co if not ci else [(torch.cat([a[0], b[0]], 2), torch.cat([a[1], b[1]], 2)) for a, b in zip(ci, co)]
+            self._kv = [(k[:, :, max(0, k.shape[2] - keep):].contiguous(), v[:, :, max(0, v.shape[2] - keep):].contiguous())
+                        for k, v in kv] \
+                if keep > 0 else None
+            self._kv_end = m.t
+            self.net.cache_in = self.net.cache_out = None
+        if isinstance(self.net, Learner3) and self.net.past_on and self.net.feat_now is not None and not cnt_:
             keep = self.net.ctx - C                        # bounded: the most earlier positions a window holds
             pp = self.net.feat_now if self.net.past_use is None else torch.cat([self.net.past_use, self.net.feat_now], 0)
             self._past, self._past_end = pp[pp.shape[0] - keep:].clone() if keep > 0 else None, m.t
@@ -550,7 +726,8 @@ class Core3(Core2):
         slot, pair, new = self._assign(ids, rec, ys)          # CPU, while the GPU runs the read and backward
         self._t('backward')
         with torch.no_grad():
-            self.theta.index_put_((key,), float(self.c["gate_lr"]) * sg * (1 - sg) * (a_ - b_) / pf, accumulate=True)
+            if not cnt_:
+                self.theta.index_put_((key,), float(self.c["gate_lr"]) * sg * (1 - sg) * (a_ - b_) / pf, accumulate=True)
         wu = int(self.c.get("warmup", 0))                  # dev: the learner's rate ramps over its first `warmup` steps
         if upd and self.c.get("rate_ctl", "fixed") == "agree":
             if not (wu and self.chunks < wu):
@@ -572,6 +749,14 @@ class Core3(Core2):
             base = self.io2.lr() if self.io2 is not None else float(self.c["lr"])
             for g in self.opt.param_groups:
                 g["lr"] = base * (self.chunks + 1) / wu
+        elif upd and getattr(self, "_rewarm", None) is not None:
+            r0, rw = self._rewarm
+            base = self.io2.lr() if self.io2 is not None else float(self.c["lr"])
+            f = min(1.0, (self.chunks - r0 + 1) / rw)
+            for g in self.opt.param_groups:
+                g["lr"] = base * f
+            if f >= 1.0:
+                self._rewarm = None
         if not upd:
             pass
         elif self.bounded:
@@ -603,11 +788,11 @@ class Core3(Core2):
         if upd and sel_:
             self._sel_mass = 0.0
         if self.chunks % 1024 == 0:
-            if not isinstance(self.opt, bounds.SphereSGD):
+            if not isinstance(self.opt, bounds.SphereSGD) and not cnt_:
                 bounds.cap_steps_(self.opt)
             bounds.cap_steps_(self.mopt)
         self._t('optimiser + bounds')
-        if self.io2 is not None:
+        if self.io2 is not None and not cnt_:
             with torch.no_grad():
                 Wo = self.net.out.weight
                 h = self.net.h if lgrad else None
@@ -626,7 +811,13 @@ class Core3(Core2):
         self._t('io2')
         with torch.no_grad():
             gE = [torch.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0) for g in gE]   # one bad tick must not reach Adam
-            if self.mix_opt == "adam":
+            if ms:                                         # mix_shared: the mixer is the learner's, on its cadence;
+                for w, g in zip((self.wE, self.wM), gE):   # the mean over the update's ticks, one Adam step
+                    w.grad = g / s_ if w.grad is None else w.grad + g / s_
+                if upd:
+                    self.mopt.step()
+                    self.wE.grad = self.wM.grad = None
+            elif self.mix_opt == "adam":
                 self.wE.grad, self.wM.grad = gE[0], gE[1]
                 self.mopt.step()
             else:
@@ -636,35 +827,7 @@ class Core3(Core2):
             if self.bounded:
                 for v in (self.wE, self.wM, self.theta):
                     v.clamp_(-bounds.SCALAR_BOUND, bounds.SCALAR_BOUND)
-            keep = 1.0 - self.ab
-            te = t0 + C
-            wj = keep[None, :] ** (C - torch.arange(C, device=d).float())[:, None]
-            self.r0 *= (keep ** float(te - self.r0_t))[:, None]
-            self.n0 *= keep ** float(te - self.r0_t)
-            self.r0_t = te
-            NB = self.NB
-            ib = self.ar[None].expand(C, NB)
-            self.r0.index_put_((ib, y[:, None].expand(C, NB)), wj, accumulate=True)
-            self.n0 += wj.sum(0)
-            for k in self.orders:
-                if new[k]:
-                    self.pc[k].index_fill_(0, self._dv(np.asarray(new[k], np.int64)), 0.0)
-                idc = idt[k]
-                Un = np.unique(ids[k - 1])
-                Un = Un[Un >= 0]
-                U = self._dv(Un)
-                f = keep[None] ** (te - self.sl[k][U]).float()[:, None]                  # (|U|, NB)
-                pp, owner = self._node_pairs(k, Un)
-                if len(pp):
-                    self.pc[k][self._dv(pp)] *= f[self._dv(owner)]
-                self.st[k][U] *= f
-                self.sl[k].index_fill_(0, U, te)
-                pj = self._dv(pair[k])[:, None].expand(C, NB)
-                self.pc[k].index_put_((pj, ib), wj, accumulate=True)
-                ix = idc[:, None].expand(C, NB)
-                self.st[k].index_put_((ix, ib), wj, accumulate=True)
-                self.pc[k][self.NPk[k]].zero_()
-                self.st[k][self.PK[k]].zero_()
+            self._store_update(ids, idt, pair, new, y, t0, C)
         self._t('store update')
         self.clock += C
         self.chunks += 1
@@ -674,6 +837,69 @@ class Core3(Core2):
         if self.clock >= self.rebase_at:
             self._rebase()
         return -torch.log2(pf)
+
+    # ---- lanes (lanes.py, Nov 18): one learner, many far-apart stores ----
+    STORE_SCALARS = ("clock", "r0_t", "n0_all", "halvings", "chunks", "rebases")
+
+    def store_state(self) -> dict:
+        """the store alone (a function of the stream: checked Nov 18), as an independent CPU copy"""
+        cpu = lambda t: t.detach().to("cpu").clone()
+        s = {k: getattr(self, k, 0) for k in self.STORE_SCALARS}
+        s.update(r0=cpu(self.r0), n0=cpu(self.n0),
+                 pc={str(k): cpu(self.pc[k]) for k in self.orders}, st={str(k): cpu(self.st[k]) for k in self.orders},
+                 sl={str(k): cpu(self.sl[k]) for k in self.orders},
+                 slots={str(k): self.slots[k].state(copy=True) for k in self.orders},
+                 pools={str(k): self.pools[k].state() for k in self.pools})
+        return s
+
+    def load_store(self, s: dict):
+        d = self.dev
+        self.clock, self.r0_t, self.n0_all = int(s["clock"]), int(s["r0_t"]), float(s["n0_all"])
+        self.halvings, self.chunks, self.rebases = int(s["halvings"]), int(s["chunks"]), int(s.get("rebases", 0))
+        self.r0.copy_(s["r0"].to(d))
+        self.n0.copy_(s["n0"].to(d))
+        for k in self.orders:
+            self.pc[k].copy_(s["pc"][str(k)].to(d))
+            self.st[k].copy_(s["st"][str(k)].to(d))
+            self.sl[k].copy_(s["sl"][str(k)].to(d))
+            self.slots[k].load(s["slots"][str(k)])
+        for k in self.pools:
+            self.pools[k].load(s["pools"][str(k)])
+        self._kv, self._kv_end = None, -1                  # the window is rebuilt from the matcher's ring
+
+    REWARM = 256                                          # ticks over which a slim checkpoint's rate re-warms
+
+    def apply_update(self, k: int, lanes: int):
+        """the shared learner's k-th update (0-based), after `lanes` ticks whose gradients were accumulated with weight
+        1/lanes each (learn_mode accumulate, learn_stride = lanes, _ext set). The same arithmetic as step()'s own
+        update at stride `lanes`: one lane reproduces a single stream exactly (tests/lanes.py)."""
+        assert self.io2 is None and self.c.get("rate_ctl", "fixed") == "fixed" and not int(self.c.get("rehearse", 0))
+        wu = int(self.c.get("warmup", 0))
+        t = (k + 1) * lanes                                # the stream's ticks so far, as step() counts them
+        if wu and t - 1 < wu:
+            for g in self.opt.param_groups:
+                g["lr"] = float(self.c["lr"]) * t / wu
+        params = list(self.net.parameters())
+        if not self.bounded or self.bound_mode == "sphere":
+            self.opt.step()
+        elif self.bound_mode == "wd":
+            bounds.clip_(params, 1.0)
+            self.opt.step()
+            with torch.no_grad():
+                torch._foreach_clamp_min_(self._vecs, -8.0); torch._foreach_clamp_max_(self._vecs, 8.0)
+        else:
+            before = bounds.norms_before(params)
+            bounds.clip_(params, 1.0)
+            self.opt.step()
+            bounds.compress_(params, before)
+        self.opt.zero_grad()
+        if int(self.c.get("mix_shared", 0)) == 1:
+            with torch.no_grad():
+                self.mopt.step()
+                self.wE.grad = self.wM.grad = None
+                if self.bounded:
+                    for v in (self.wE, self.wM, self.theta):
+                        v.clamp_(-bounds.SCALAR_BOUND, bounds.SCALAR_BOUND)
 
     def _bounded_step(self):
         """one optimiser step under the model's bounding, exactly as the tick's own step."""
@@ -921,7 +1147,10 @@ class Core3(Core2):
 
     @torch.no_grad()
     def _halve(self):
-        self.__dict__.setdefault("_halv_clocks", []).append(self.clock)       # for leave-one-out reads
+        if getattr(self, "loo_ages", None):                                   # leave-one-out reads (a lab option)
+            hc = self.__dict__.setdefault("_halv_clocks", [])                 # bounded: nothing grows (1.4.0)
+            hc.append(self.clock)
+            del hc[:-1024]
         self.r0[-1] *= 0.5
         self.n0[-1] *= 0.5
         for k in self.orders:
@@ -946,6 +1175,8 @@ class Core3(Core2):
         for k, pool in self.pools.items():
             pool.last = pool.last - off
         self.chunks -= offc
+        if getattr(self, "_halv_clocks", None):
+            self._halv_clocks = [c - off for c in self._halv_clocks]
         self.rebases = getattr(self, "rebases", 0) + 1
 
     def stats(self) -> dict:
@@ -990,6 +1221,9 @@ class Core3(Core2):
             io2=self.io2.state() if self.io2 is not None else None,
             sel=dict(mass=float(getattr(self, "_sel_mass", 0.0)), phase=float(getattr(self, "_sel_phase", 0.0))),
             past=None if getattr(self, "_past", None) is None else dict(f=cpu(self._past), end=int(self._past_end)),
+            rewarm=None if getattr(self, "_rewarm", None) is None else list(self._rewarm),
+            kv=None if getattr(self, "_kv", None) is None else dict(k=[cpu(k) for k, _ in self._kv],
+                                                                  v=[cpu(v) for _, v in self._kv], end=int(self._kv_end)),
             ctl=dict(lr=float(self.ctl_lr), cos=float(getattr(self, "ctl_cos", 0.0)), k=int(getattr(self, "_lag_k", 0)),
                      snap_k=int(getattr(self, "_snap_k", -10**9)),
                      old=[t.cpu() for t in self._snap_old] if getattr(self, "_snap_old", None) else None,
@@ -1015,8 +1249,16 @@ class Core3(Core2):
         for k in self.pools:
             self.pools[k].load(s["pools"][str(k)])
         self.net.load_state_dict(s["net"])
-        self.opt.load_state_dict(s["opt"])
-        self.mopt.load_state_dict(s["mopt"])
+        # 1.4.0: a slim checkpoint (shared, read-only use) carries no optimiser state. Learning from one starts fresh
+        # moments, so its rate re-warms over REWARM ticks instead of taking Adam's full-size first steps
+        if s.get("opt") is not None:
+            self.opt.load_state_dict(s["opt"])
+        else:
+            self._rewarm = (int(self.chunks), self.REWARM)
+        if s.get("mopt") is not None:
+            self.mopt.load_state_dict(s["mopt"])
+        if s.get("rewarm") is not None:
+            self._rewarm = tuple(int(v) for v in s["rewarm"])
         with torch.no_grad():
             self.wE.copy_(s["wE"].to(d))
             self.wM.copy_(s["wM"].to(d))
@@ -1025,6 +1267,9 @@ class Core3(Core2):
             self.io2.load(s["io2"])
         p_ = s.get("past")
         self._past, self._past_end = (p_["f"].to(d), int(p_["end"])) if p_ else (None, -1)
+        kv_ = s.get("kv")
+        self._kv, self._kv_end = ([(k.to(d), v.to(d)) for k, v in zip(kv_["k"], kv_["v"])], int(kv_["end"])) if kv_ \
+            else (None, -1)
         if s.get("ctl"):
             self.ctl_lr, self.ctl_cos = float(s["ctl"]["lr"]), float(s["ctl"]["cos"])
             cs = s["ctl"]; self._lag_k = int(cs.get("k", 0)); self._snap_k = int(cs.get("snap_k", -10**9))

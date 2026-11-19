@@ -1,4 +1,5 @@
 torch>=2.8
 numpy>=2.0
 sentencepiece>=0.2
+numba>=0.60
 pytest>=8

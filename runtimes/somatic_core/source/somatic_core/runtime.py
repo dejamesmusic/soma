@@ -36,15 +36,16 @@ import torch
 try:
     from .core import Matcher
     from .core3 import Core3
-    from .data import Stream, byte_lengths, encode_bytes, tokenizer
+    from .data import FORBIDDEN, Stream, byte_lengths, encode_bytes, read_segment, tokenizer
 except ImportError:                                                     # as scripts in this folder
     from core import Matcher
     from core3 import Core3
-    from data import Stream, byte_lengths, encode_bytes, tokenizer
+    from data import FORBIDDEN, Stream, byte_lengths, encode_bytes, read_segment, tokenizer
 
 SPECIES = "somatic_core"
 RUNTIME_ID = "soma.somatic_core"
-RUNTIME_VERSION = "1.2.1"
+RUNTIME_VERSION = "1.4.0"
+SESSION_FILE = "soma_state"                                               # the control that opens a file in a session
 CHECKPOINT_FORMAT = "somatic-core-pytorch"
 CHECKPOINT_VERSION = 1
 EPS = 1e-12
@@ -189,7 +190,7 @@ LEGACY_DEFAULTS = dict(att_past=0, learner="mlp", att_heads=6, att_ctx=1024, att
 
 IDENTITY = ("kmax", "k1", "p2", "k2", "p3", "k3", "np1", "np2", "np3", "ladder", "window", "emb", "hidden", "depth",
             "final_norm", "bound_mode", "proj", "minl", "ring", "ctx_decay", "alltime_cap", "seed",
-            "learner", "att_heads", "att_ctx", "att_inject", "att_past", "skips", "skip_size", "timescales", "slot_page")
+            "learner", "att_heads", "att_ctx", "att_inject", "att_past", "att_rope", "skips", "skip_size", "timescales", "slot_page")
 
 
 @dataclass
@@ -217,6 +218,9 @@ class CoreConfig:
     skip_size: int = 3              # dev: skip orders' slots and pair pools are sized like this order (2 or 3)
     att_inject: str = "every"       # dev: where the store enters the attention learner ("input" | "every")
     att_past: int = 0               # dev: the window's earlier positions carry their own store reads (Learner3 past=1)
+    att_rope: int = 0               # dev (Nov 18): rotary positions in the attention learner (needed by att_cache)
+    att_cache: int = 0              # dev (Nov 18): each position computed once, at its tick; later ticks read its keys/values
+                                    #   1 = the window is ctx per tick (as uncached); 2 = exactly ctx per position, any tick
     warmup: int = 200                 # dev: learner steps over which its rate ramps up (0: none)
     window: int = 16
     emb: int = 64
@@ -254,6 +258,7 @@ class CoreConfig:
     ctl_min: float = 1e-6
     ctl_max: float = 1e-2
     mix_adam: float = 3e-3
+    mix_shared: int = 0          # the exact mixer (wE/wM) is the learner's, not the store's: count() is counts only (Nov 18). 1: it steps with the learner (mean over its update); 2: every tick, as with 0
     gate_lr: float = 0.02
     wd: float = 0.002               # decoupled, on the learner's matrices (1.1; 0.002 from the Nov 12 1 GB runs); radial checkpoints keep their own
     learn_stride: int = 1          # learner optimiser steps on one tick in this many (it predicts every token)
@@ -278,7 +283,11 @@ class CoreConfig:
         assert self.rehearse >= 0 and self.rehearse_span >= 1
         assert self.bound_mode in ("radial", "wd", "sphere")
         assert self.rate_ctl in ("fixed", "agree", "hyper") and not (self.rate_ctl == "agree" and self.io2), "one rate controller"
-        assert self.learner != "attn" or self.att_ctx >= self.chunk, "att_ctx must cover a tick (positions index past it)"
+        assert self.learner != "attn" or self.att_ctx >= self.chunk or self.att_cache == 2, \
+            "att_ctx must cover a tick (positions index past it), unless the window is per position (att_cache=2)"
+        assert not self.att_cache or (self.att_rope and not self.att_past), "att_cache needs att_rope (and not att_past)"
+        assert self.learner != "attn" or (self.att_heads >= 1 and self.hidden % self.att_heads == 0), \
+            f"width {self.hidden} must divide into {self.att_heads} attention heads"
         return self
 
     def public_dict(self):
@@ -300,6 +309,8 @@ class SOMA:
         self.core = Core3(self.config.public_dict(), str(self.device), self.blen)
         self.stream_ctx = Matcher(self.config.ring, self.config.minl)
         self.chat_ctx = Matcher(self.config.ring, self.config.minl)
+        self.pending = np.zeros(0, np.int64)                             # the stream's unfilled tick (1.3.0)
+        self._synced = True                                              # chat_ctx == stream_ctx + pending
         self.description = str(description)
         self.checkpoint_id = uuid.uuid4().hex
         self.revision_id = uuid.uuid4().hex
@@ -425,9 +436,12 @@ class SOMA:
               report_callback: Callable[[dict], None] | None = None, dream_every_batches=0, dream_length=128,
               dream_temperature=0.8, dream_callback: Callable[[str, int, int], None] | None = None,
               dream_stateful=False, resume_state=None, exact_start=False,
-              stop_callback: Callable[[], bool] | None = None, **_unused):
+              stop_callback: Callable[[], bool] | None = None, learn=True, **_unused):
         """read the corpus in order, one stream, for `epochs` passes over the byte range (or follow an append-only
-        file from an exact byte with exact_start). Every tick is scored before it is learned from."""
+        file from an exact byte with exact_start). Every tick is scored before it is learned from.
+        1.3.0: the corpus joins the model's one stream (see _feed): its tokens follow whatever the stream held
+        last, are learned in exact ticks, and a final part-filled tick waits in `pending` for whatever comes next.
+        learn=False scores and reads without learning."""
         path = Path(corpus_path).expanduser().resolve()
         size = path.stat().st_size
         lo = int(start_byte)
@@ -451,12 +465,11 @@ class SOMA:
             ids = stream.next(SEGMENT)[0]
             if exact_start and stream.wraps[0]:
                 break
-            nb = self._tick(ids, self.stream_ctx, learn=True)
-            self.life["bytes"] += nb
-            self.life["tokens"] += len(ids)
-            self.life["scored_bytes"] += nb
+            fed = {}
+            self._feed(ids, learn=learn, totals=(fed,), read=False)
+            nb = fed.get("bytes", 0.0)
             session["bytes"] += nb
-            session["tokens"] += len(ids)
+            session["tokens"] += fed.get("tokens", 0)
             window["bytes"] += nb
             session["batches"] += 1
             batches += 1
@@ -559,74 +572,167 @@ class SOMA:
         p = p / p.sum()
         return int(torch.multinomial(p, 1, generator=self.sampler))
 
+    # ---- the stream (1.3.0) ----
+    # A model lives one stream. Every token it meets goes into it in order, whatever the source: words typed to it,
+    # files it reads, corpora it trains on, and its own replies, with the markers that open each span:
+    #   <|user|>        words someone typed
+    #   <|soma_state|>  a file (the alphabet's reserved control, never used before 1.3.0; SESSION_FILE names it)
+    #   <|soma|>        its own reply, closed by <|turn|>
+    # It learns the stream in exact ticks of `chunk` tokens, the tick training has always run: every token is scored
+    # once, before it is learned from, and learned once, whatever its source. Tokens wait in `pending` until a tick
+    # fills, and the unfilled tick is saved with the checkpoint. stream_ctx is the stream as learned; chat_ctx, the
+    # context the model reads and replies from, is the same stream with the pending tail. So nothing in the learning
+    # changes with a prompt's length, and its own words stay in its context (and its store's counts) like any other.
     def _chat_window(self):
-        """1.2.0: the attention learner only ever predicts behind a full window (att_ctx tokens; training reads every
-        tick that way), and a short window gives noise. A chat context shorter than that starts as a copy of the stream
-        context (what the model was reading), then a blank line, the corpus's document break. Changes nothing for the
-        mlp learner or a chat that is already long enough."""
-        if self.config.learner != "attn" or self.chat_ctx.t >= int(self.config.att_ctx) or self.stream_ctx.t < 1:
+        """bring the reading context up to the stream: the learned stream, then its unlearned tail. (Before 1.3.0 the
+        chat had a context of its own; a checkpoint from then reads from its stream from here on.)"""
+        if self._synced:
             return
         self.chat_ctx = self.stream_ctx.clone()
-        self.core.observe(self.chat_ctx, encode_bytes(self.tokenizer, b"\n\n"))
+        getattr(self.core, "read", self.core.observe)(self.chat_ctx, self.pending)   # read: through the learner's window
+        self._synced = True
+
+    def _feed(self, ids, learn=True, totals=None, read=True):
+        """tokens join the stream: read into the context at once (read=False leaves the reading context to be rebuilt,
+        for long reads), learned in whole ticks as they fill. totals, if given, collects the ticks' bytes and tokens."""
+        ids = np.asarray(ids, np.int64).reshape(-1)
+        if not len(ids):
+            return
+        C = int(self.config.chunk)
+        # a tick learned here moves the weights, and the reading context's attention window with them: it is then
+        # rebuilt from the stream (its training window plus the unlearned tail) at next use, not read token by token
+        # into a window the update has outdated (Nov 18)
+        if read and self._synced and len(self.pending) + len(ids) < C:
+            getattr(self.core, "read", self.core.observe)(self.chat_ctx, ids)
+        else:
+            self._synced = False
+        self.pending = np.concatenate([self.pending, ids])
+        while len(self.pending) >= C:
+            tick, self.pending = self.pending[:C], self.pending[C:]
+            nb = self._tick(tick, self.stream_ctx, learn=learn)
+            self.life["bytes"] += nb
+            self.life["tokens"] += C
+            self.life["scored_bytes"] += nb
+            if totals is not None:
+                for d in totals:
+                    d["bytes"] = d.get("bytes", 0.0) + nb
+                    d["tokens"] = d.get("tokens", 0) + C
+                    d["batches"] = d.get("batches", 0) + 1
+
+    def _learned_into(self, *dicts):
+        """the scored ticks' bits since the last call, into each dict (and the life)"""
+        d = self.core.drain()
+        for k in ("bits_exact", "bits_learner", "bits_final"):
+            self.life[k] += d[k]
+        for out in dicts:
+            for k_src in ("bits_exact", "bits_learner", "bits_final", "correct", "scored"):
+                out[k_src] = out.get(k_src, 0.0) + d[k_src]
+
+    def _mark(self, name, online):
+        self._chat_window()
+        self._feed([self.tokenizer.control_ids[name]], learn=bool(online))
+        self._learned_into()
 
     def ingest_text(self, text, online=False):
+        """words straight into the stream, with no marker"""
         self._chat_window()
-        ids = np.asarray(encode_bytes(self.tokenizer, str(text).encode("utf-8")), np.int64)
-        if len(ids):
-            if online:
-                self._tick(ids, self.chat_ctx, learn=True)
-                self.core.drain()
-            else:
-                self.core.observe(self.chat_ctx, ids)
+        self._feed(encode_bytes(self.tokenizer, str(text).encode("utf-8")), learn=bool(online))
+        self._learned_into()
 
     def ingest_prompt(self, text, online=False, mark_turn=True):
-        """a user turn: [user] text [soma]. Markers are read into the context; the user's words learn when online."""
-        self._chat_window()
-        ctl = self.tokenizer.control_ids
-        body = np.asarray(encode_bytes(self.tokenizer, str(text).encode("utf-8")), np.int64)
+        """a typed turn and the reply's opening: <|user|> text <|soma|> (the pre-1.3.0 chat call, now on the stream)"""
         if mark_turn:
-            self.core.observe(self.chat_ctx, [ctl["user"]])
-        if len(body):
-            if online:
-                self._tick(body, self.chat_ctx, learn=True)
-                self.core.drain()
-            else:
-                self.core.observe(self.chat_ctx, body)
-        self.core.observe(self.chat_ctx, [ctl["soma"]])
+            self.session_text(text, online=online)
+        else:
+            self.ingest_text(text, online=online)
+        self.session_reply(online=online)
+
+    def session_text(self, text, online=False):
+        """typed words: <|user|> text"""
+        self._chat_window()
+        body = np.asarray(encode_bytes(self.tokenizer, str(text).encode("utf-8")), np.int64)
+        self._feed(np.concatenate([np.asarray([self.tokenizer.control_ids["user"]], np.int64), body]), learn=bool(online))
+        self._learned_into()
+
+    def session_file(self, path, online=True, report_every=1, report_callback=None, stop_callback=None):
+        """a file: <|soma_state|> then its bytes once, start to end, in the stream's ticks (nothing after its end: a
+        training pass wraps to fill its last tick, which here would put the file's opening after its end).
+        -> the read's totals (bytes, tokens and bits of the ticks it completed)"""
+        path = Path(path).expanduser().resolve()
+        assert not any(w in path.name.lower() for w in FORBIDDEN), "never read iMessage-derived data"
+        size = path.stat().st_size
+        self._mark(SESSION_FILE, online)
+        shim = type("Read", (), {})()
+        shim.bytes_read, shim.wraps = np.zeros(1, np.int64), np.zeros(1, np.int64)
+        session, window = dict(bytes=0.0, tokens=0, batches=0), dict(bytes=0.0)
+        started, reported = time.time(), 0
+        with path.open("rb") as f:
+            while not (stop_callback and stop_callback()):
+                raw = read_segment(f, size, 4096)
+                if not raw:
+                    break
+                shim.bytes_read[0] += len(raw)
+                self._feed(encode_bytes(self.tokenizer, raw), learn=bool(online), totals=(session, window), read=False)
+                if report_every and session["batches"] - reported >= int(report_every):
+                    reported = session["batches"]
+                    self._learned_into(window, session)
+                    if report_callback:
+                        report_callback(self._report(session, window, started, shim, 0, size, 1, np.zeros(1, np.int64)))
+                    window = dict(bytes=0.0)
+        self._learned_into(window, session)
+        self._chat_window()
+        session["file_bytes"] = int(shim.bytes_read[0])
+        return session
+
+    def session_reply(self, online=False):
+        """the reply begins: <|soma|> (generate() then samples until <|turn|> or its length)"""
+        self._mark("soma", online)
 
     @torch.no_grad()
     def next_logits(self) -> torch.Tensor:
         self._chat_window()
         return torch.log(self.core.next_distribution(self.chat_ctx).clamp_min(1e-30))
 
-    def _generation_tokens(self, length, temperature, ctx=None):
-        if ctx is None:
+    def _generation_tokens(self, length, temperature, ctx=None, learn=True):
+        """samples; in the reading context each one joins the stream (and is learned when its tick fills, like any
+        other token). A sample from a copy of a context (ctx given) stays there."""
+        stream = ctx is None
+        if stream:
             self._chat_window()
         ctx = self.chat_ctx if ctx is None else ctx
         forbidden = list(self.tokenizer.generation_forbidden_ids)
         turn = self.tokenizer.control_ids["turn"]
         ended = False
+
+        def take(t):
+            if stream:
+                self._feed([t], learn=learn)
+                self._learned_into()
+                self._chat_window()                  # after a learned tick the reading context is rebuilt
+            else:
+                self.core.observe(ctx, [t])
         try:
             for _ in range(int(length)):
-                t = self._sample(self.core.next_distribution(ctx), float(temperature), forbidden)
-                self.core.observe(ctx, [t])                                     # read, never learned (a sample)
+                c = self.chat_ctx if stream else ctx
+                t = self._sample(self.core.next_distribution(c), float(temperature), forbidden)
+                take(t)
                 if t == turn:
                     ended = True
                     break
                 yield t
         finally:
             if not ended:
-                self.core.observe(ctx, [turn])
+                take(turn)
 
-    def generate_ids(self, length=200, temperature=1.0, **_unused):
-        return list(self._generation_tokens(length, temperature))
+    def generate_ids(self, length=200, temperature=1.0, learn=True, **_unused):
+        return list(self._generation_tokens(length, temperature, learn=learn))
 
     def generate_text(self, length=200, temperature=1.0, **kwargs):
         return self.tokenizer.decode(self.generate_ids(length, temperature))
 
-    def generate(self, length=200, temperature=1.0, **_unused):
+    def generate(self, length=200, temperature=1.0, learn=True, **_unused):
         decoder = self.tokenizer.incremental_decoder()
-        for t in self._generation_tokens(length, temperature):
+        for t in self._generation_tokens(length, temperature, learn=learn):
             yield from decoder.push(t)
         yield from decoder.finish()
 
@@ -636,6 +742,8 @@ class SOMA:
             self._chat_window()
         base = self.stream_ctx if source == "stream" else self.chat_ctx
         ctx = base if stateful else base.clone()
+        if stateful:
+            self._synced = False                     # a stateful dream writes into a context: rebuild the reading one
         state = None if stateful else self.sampler.get_state()
         try:
             out = []
@@ -701,8 +809,9 @@ class SOMA:
             "root_lineage_id": self.root_lineage_id, "created_at": self.created_at, "revision_history": history[-256:],
             "forked_from_checkpoint_id": self.forked_from_checkpoint_id,
             "forked_from_revision_id": self.forked_from_revision_id, "tokenizer_sha256": self.tokenizer.sha256,
-            "core": pack(self.core.state_dict(lean=True), copy=False), "stream_ctx": pack(self.stream_ctx.state()),
-            "chat_ctx": pack(self.chat_ctx.state()), "sampler": self.sampler.get_state(),
+            "optimizer": "absent" if getattr(self, "_slim", False) else "present",
+            "core": pack(self._core_state(), copy=False), "stream_ctx": pack(self.stream_ctx.state()),
+            "chat_ctx": pack(self.chat_ctx.state()), "pending": [int(t) for t in self.pending], "sampler": self.sampler.get_state(),
             "source_cursor": pack(self._source_cursor), "life": dict(self.life),
             # plain metadata for readers that never unpack the core (logOS's checkpoint parser)
             "bytes_seen": int(self.bytes_seen), "tokens_seen": int(self.tokens_seen), "parameters": int(self.params()),
@@ -760,7 +869,8 @@ class SOMA:
         existing = _read_json(Path(f"{path}.meta.json"))
         c = self.config
         sidecar = {
-            "sidecar_version": 4, "species": self.species, "runtime_id": RUNTIME_ID, "runtime_version": RUNTIME_VERSION,
+            "sidecar_version": 4, "optimizer": "absent" if getattr(self, "_slim", False) else "present",
+            "species": self.species, "runtime_id": RUNTIME_ID, "runtime_version": RUNTIME_VERSION,
             "checkpoint_format": CHECKPOINT_FORMAT, "checkpoint_version": CHECKPOINT_VERSION,
             "checkpoint_id": self.checkpoint_id, "revision_id": self.revision_id,
             "parent_revision_id": self.parent_revision_id, "root_lineage_id": self.root_lineage_id,
@@ -788,6 +898,27 @@ class SOMA:
             sidecar["profile"] = existing["profile"]
         _write_json_atomic(Path(f"{path}.meta.json"), sidecar)
 
+    def _core_state(self) -> dict:
+        st = self.core.state_dict(lean=True)
+        if getattr(self, "_slim", False):                 # slim: the optimisers' moments stay home (about 2/3 of a
+            st = dict(st, opt=None, mopt=None)            # learner's bytes); loading re-warms the rate
+        return st
+
+    def export_slim(self, path):
+        """a copy to share (1.4.0): a fork of this model without optimiser state. This model stays as it was. Opened,
+        it reads and talks exactly like the original; when it learns, its rate re-warms over Core3.REWARM ticks."""
+        keep = (self.checkpoint_id, self.parent_revision_id, self.root_lineage_id, self.revision_id,
+                self._loaded_checkpoint_path, self.created_at, self._revision_published, self.revision_history,
+                self.forked_from_checkpoint_id, self.forked_from_revision_id)
+        self._slim = True
+        try:
+            return self.save_fork(path)
+        finally:
+            self._slim = False
+            (self.checkpoint_id, self.parent_revision_id, self.root_lineage_id, self.revision_id,
+             self._loaded_checkpoint_path, self.created_at, self._revision_published, self.revision_history,
+             self.forked_from_checkpoint_id, self.forked_from_revision_id) = keep
+
     def save_fork(self, path):
         old = (self.checkpoint_id, self.parent_revision_id, self.root_lineage_id, self.revision_id,
                self._loaded_checkpoint_path, self.created_at, self._revision_published, self.revision_history,
@@ -811,6 +942,16 @@ class SOMA:
             raise
 
     @classmethod
+    def create(cls, values: dict | None = None, description="", device="auto", seed=7):
+        """a new model from settings by name (strings as a form sends them; blanks keep the defaults)"""
+        base = CoreConfig().public_dict()
+        for key, value in (values or {}).items():
+            if key in base and str(value).strip() != "":
+                kind = type(base[key])
+                base[key] = (str(value).lower() in ("1", "true", "yes")) if kind is bool else kind(value)
+        return cls(CoreConfig(**base), device=device, seed=int(seed), description=str(description))
+
+    @classmethod
     def from_checkpoint(cls, path, device="auto", tokenizer_path=None):
         path = Path(path).expanduser().resolve()
         pointer = _read_json(Path(f"{path}.revision.json"))
@@ -831,6 +972,9 @@ class SOMA:
         gc.collect()
         model.stream_ctx = Matcher.from_state(unpack(ck["stream_ctx"]))
         model.chat_ctx = Matcher.from_state(unpack(ck["chat_ctx"]))
+        # 1.3.0: the stream's unfilled tick; the reading context is rebuilt from the stream at first use
+        model.pending = np.asarray(ck.get("pending", np.zeros(0, np.int64)), np.int64).reshape(-1)
+        model._synced = False
         model.sampler.set_state(ck["sampler"])
         model._source_cursor = unpack(ck.get("source_cursor"))
         for k in ("checkpoint_id", "revision_id", "parent_revision_id", "root_lineage_id", "created_at",

@@ -1,9 +1,9 @@
 {
   "protocolVersion": 1,
   "id": "soma.somatic_core",
-  "version": "1.2.1",
+  "version": "1.4.0",
   "name": "somatic core",
-  "description": "bounded continual learner: an exact context store on a phi ladder of timescales (orders 1-3, phi^5 tokens to all-time) read by a causal attention learner over the last 1024 tokens, the store injected at every block, mixed per context \u00b7 8k alphabet \u00b7 fixed rate \u00b7 nothing grows",
+  "description": "bounded continual learner: an exact context store on a phi ladder of timescales (orders 1-3, phi^5 tokens to all-time) read by a causal attention learner over the last 1024 tokens, the store injected at every block, mixed per context · 8k alphabet · fixed rate · nothing grows",
   "python": "/Library/Frameworks/Python.framework/Versions/3.11/bin/python3",
   "sourceRoot": "source",
   "worker": "somatic_core/somatic_train_worker.py",
@@ -15,7 +15,8 @@
     "chat",
     "evaluate",
     "fork",
-    "stream"
+    "stream",
+    "session"
   ],
   "checkpoint": {
     "format": "somatic-core-pytorch",
@@ -31,7 +32,9 @@
       "1.0.1",
       "1.1.0",
       "1.2.0",
-      "1.2.1"
+      "1.2.1",
+      "1.3.0",
+      "1.4.0"
     ],
     "cursorPolicy": "resume-saved",
     "lineage": true

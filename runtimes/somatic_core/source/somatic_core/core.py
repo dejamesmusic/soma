@@ -33,13 +33,15 @@ import math
 import numpy as np
 import torch
 
+from . import jit
+
 PHI = 1.618034
 LB = 6                                    # match-length buckets (0: no match)
 ENT_EDGES = (1.0, 2.0, 4.0, 6.0)          # entropy bins (bits) of the exact reader, for the final mix gate
 NE = len(ENT_EDGES) + 1
 
 
-class Matcher:
+class PyMatcher:
     """the history of one context (a training stream, a chat): a ring of the last `ring` tokens, a short tail of
     python ints for keys, and the token match model over the ring. Bounded: the key map is pruned past 4 rings."""
 
@@ -127,7 +129,79 @@ class Matcher:
         return m
 
     def clone(self) -> "Matcher":
-        return Matcher.from_state(self.state())
+        c = type(self).from_state(self.state())
+        g = getattr(self, "_gen", None)              # a generation window travels with its context (Nov 18): the copy
+        if g is not None:                            # shares tensors (never written in place) but owns its lists
+            c._gen = dict(g, kv=[list(x) for x in g["kv"]])
+        return c
+
+
+class JitMatcher(PyMatcher):
+    """the same Matcher on numpy state for the compiled path (jit.py): ms = [t, mp, ml, ready, cur token, cur bucket,
+    table entries]; the `last` map is a hash table (lk, lv) of packed keys. Stale entries (t - q >= ring) never match,
+    so a table keeps the dict's answers exactly; it is pruned to live entries at the dict's size (4 rings)."""
+
+    def __init__(self, ring: int, minl: int):
+        self.ring, self.minl = int(ring), int(minl)
+        self.R = np.zeros(self.ring, np.int64)
+        self.ms = np.array([0, -1, 0, 0, -1, 0, 0], np.int64)
+        cap = 1 << (8 * self.ring - 1).bit_length()
+        self.lk = np.full(cap, -1, np.int64)
+        self.lv = np.zeros(cap, np.int64)
+
+    t = property(lambda s: int(s.ms[0]), lambda s, v: s.ms.__setitem__(0, int(v)))
+    mp = property(lambda s: int(s.ms[1]), lambda s, v: s.ms.__setitem__(1, int(v)))
+    ml = property(lambda s: int(s.ms[2]), lambda s, v: s.ms.__setitem__(2, int(v)))
+    ready = property(lambda s: bool(s.ms[3]), lambda s, v: s.ms.__setitem__(3, int(bool(v))))
+    cur = property(lambda s: (int(s.ms[4]), int(s.ms[5])))
+
+    @property
+    def tail(self) -> list:
+        n = min(self.t, 128)
+        return [int(v) for v in self.R[np.arange(self.t - n, self.t) % self.ring]]
+
+    def window(self, w: int) -> list:
+        tail = self.tail[-w:]
+        return [0] * (w - len(tail)) + tail
+
+    def peek(self):
+        jit.m_peek(self.R, self.ms, self.lk, self.lv, self.ring, self.minl)
+        return int(self.ms[4]), int(self.ms[5])
+
+    def push(self, y: int):
+        jit.m_push(self.R, self.ms, self.lk, self.lv, self.ring, self.minl, int(y), self.rebase_at)
+
+    def rebase(self):
+        off = (self.t // self.ring - 1) * self.ring
+        if off <= 0:
+            return
+        self.ms[0] -= off
+        if self.ms[1] >= 0:
+            self.ms[1] -= off
+        jit.lt_rebuild(self.lk, self.lv, self.ms, self.ms[0], np.int64(1) << np.int64(62), off)
+
+    def state(self) -> dict:
+        u = self.lk >= 0
+        kk, vv = self.lk[u], self.lv[u]
+        keys = np.stack([(kk >> (16 * i)) & 0xFFFF for i in range(self.minl)], 1).astype(np.int64)
+        return dict(ring=self.ring, minl=self.minl, R=self.R.copy(), t=self.t, mp=self.mp, ml=self.ml,
+                    keys=keys, vals=vv.copy(), tail=np.array(self.tail, np.int64), ready=self.ready, cur=list(self.cur))
+
+    @classmethod
+    def from_state(cls, s: dict) -> "JitMatcher":
+        m = cls(int(s["ring"]), int(s["minl"]))
+        m.R = np.asarray(s["R"], np.int64).copy()
+        cur = s["cur"]
+        m.ms[:6] = [int(s["t"]), int(s["mp"]), int(s["ml"]), int(bool(s["ready"])), int(cur[0]), int(cur[1])]
+        keys = np.asarray(s["keys"], np.int64).reshape(-1, m.minl)
+        kk = np.zeros(len(keys), np.int64)
+        for i in range(m.minl):
+            kk |= keys[:, i] << (16 * i)
+        jit.lt_load(m.lk, m.lv, m.ms, kk, np.asarray(s["vals"], np.int64), m.ms[0], m.ring)
+        return m
+
+
+Matcher = JitMatcher if jit.HAVE else PyMatcher
 
 
 class IntIndex:
@@ -225,8 +299,12 @@ class Pool:
     def lookup(self, key) -> int:
         return self.map.get(_key(key), -1)
 
-    def touch(self, key, t: int):
-        """the node for `key` at token time t, allocating (and possibly evicting) on a first sight. -> (node, evicted)"""
+    def touch(self, key, t: int, t0=None):
+        """the node for `key` at token time t, allocating (and possibly evicting) on a first sight. -> (node, evicted)
+        t0 (1.4.0): the tick's start. A node touched in this tick (last >= t0) is never evicted in it, so no prediction
+        in a tick depends on a later context (an early query's node recycled by a later key read its counts cleared,
+        and its successors joined the new key; assessment, Nov 19). With every sampled candidate in use, up to 8 draws
+        of 8; then the context has no node this tick (-1: it reads and learns as unseen)."""
         kk = _key(key)
         n = self.map.get(kk, None)
         evicted = False
@@ -237,8 +315,19 @@ class Pool:
                 self.nxt += 1
             else:
                 lg = self.lg
-                cand = self.rng.integers(0, self.P, size=8)
-                n = int(min(cand, key=lambda c: float(sc[c]) * math.exp(lg * (t - int(la[c])))))
+                n, bs = -1, 0.0
+                for _ in range(8):
+                    for c in self.rng.integers(0, self.P, size=8):
+                        c = int(c)
+                        if t0 is not None and int(la[c]) >= t0:
+                            continue
+                        v = float(sc[c]) * math.exp(lg * (t - int(la[c])))
+                        if n < 0 or v < bs:
+                            n, bs = c, v
+                    if n >= 0:
+                        break
+                if n < 0:
+                    return -1, False
                 self.map.delete(_key(self.keys[n].tolist()))
                 evicted = True
                 self.recycles += 1
@@ -430,11 +519,55 @@ class Core:
             g["lr"] = float(self.c["lr"])
 
     # ---- the CPU pass of one chunk ----
+    def _key_offs(self):
+        if getattr(self, "_koffs", None) is None:
+            self._koffs = {k: np.asarray(self.skip_offs.get(k, tuple(range(k, 0, -1))), np.int64) for k in self.orders[1:]}
+            self._kneed = max([1] + [int(o.max()) for o in self._koffs.values()])
+        return self._koffs, self._kneed
+
+    def _contexts_jit(self, m, ys, learn: bool):
+        """_contexts on the compiled path (jit.py): the pools of different orders never meet, so each order's pool walks
+        the tick on its own, then the matcher walks it; every step is the Python path's, in the same order per object"""
+        ys = np.ascontiguousarray(ys, np.int64)
+        C = len(ys)
+        W = int(self.c["window"])
+        offs, need = self._key_offs()
+        t0h = m.t
+        s = t0h - need + np.arange(need)
+        hist = np.empty(need + C, np.int64)
+        hist[:need] = np.where(s >= 0, m.R[s % m.ring], 0)
+        hist[need:] = ys
+        ids = np.full((len(self.orders), C), -1, np.int64)
+        ids[0] = hist[need - 1:need - 1 + C]
+        if t0h < 1:
+            ids[0, :1 - t0h] = -1
+        rec = {self.orders[0]: []}
+        rp = np.empty(C, np.int64)
+        rn = np.empty(C, np.int64)
+        for k in self.orders[1:]:
+            P = self.pools[k]
+            rng = jit.pcg_pack(P.rng.bit_generator.state)
+            rng0 = rng.copy()
+            meta = np.array([P.nxt, P.recycles], np.int64)
+            ne = jit.pool_tick(P.map.keys, P.map.vals, P.map.bits, P.map.mask, P.keys, P.score, P.last, meta, P.P, P.lg,
+                               rng, hist, need, offs[k], t0h, self.clock, C, bool(learn), ids[k - 1], rp, rn)
+            P.nxt, P.recycles = int(meta[0]), int(meta[1])
+            if not np.array_equal(rng, rng0):
+                P.rng.bit_generator.state = jit.pcg_unpack(rng)
+            rec[k] = list(zip(rp[:ne].tolist(), rn[:ne].tolist()))
+        mp = np.empty(C, np.int64)
+        mb = np.empty(C, np.int64)
+        win = np.zeros((C, W), np.int64)
+        jit.m_tick(m.R, m.ms, m.lk, m.lv, m.ring, m.minl, ys, W, m.rebase_at, mp, mb, win)
+        return ids, rec, mp, mb, win
+
     def _contexts(self, m, ys, learn: bool):
         """node ids per order and position, match predictions and windows, advancing the context's history.
         ys may be None (a single read of the next position, nothing pushed).
         m may be a list of B Matchers (lanes, a dev feature, Nov 10): the chunk is then B equal blocks, block j from
         lane j's stream with lane j's own history. The store and learner see the blocks in order, as one stream."""
+        if ys is not None and isinstance(m, JitMatcher) and len(ys):
+            return self._contexts_jit(m, ys, learn)
         C = 1 if ys is None else len(ys)
         lanes = list(m) if isinstance(m, (list, tuple)) else [m]
         assert C % len(lanes) == 0, "a laned chunk is B equal blocks"
@@ -457,7 +590,7 @@ class Core:
                 if offs is not None and n_hist >= max(offs):
                     key = tuple(tail[-o] for o in offs)
                     if learn:
-                        n, ev = self.pools[k].touch(key, self.clock + i)
+                        n, ev = self.pools[k].touch(key, self.clock + i, self.clock)
                         if ev:
                             rec[k].append((i, n))
                     else:
@@ -466,7 +599,7 @@ class Core:
                 elif offs is None and n_hist >= k:
                     key = tuple(tail[-k:])
                     if learn:
-                        n, ev = self.pools[k].touch(key, self.clock + i)
+                        n, ev = self.pools[k].touch(key, self.clock + i, self.clock)
                         if ev:
                             rec[k].append((i, n))
                     else:
