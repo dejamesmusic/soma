@@ -1,12 +1,12 @@
 {
   "lockVersion": 1,
-  "runtime": "soma.somatic_core@1.5.1",
-  "digest": "0d431d94e2db51644663b2eff55c4e5a3116f59cbdd00d853134272163be12d5",
+  "runtime": "soma.somatic_core@1.5.2",
+  "digest": "f24558f409425310791b7661143fc1da3601038ea8c25e824febd7fbb51ac63b",
   "files": [
     {
       "path": "runtime.json",
-      "sha256": "c94587f7e4a2419f4cb06f9837ed60aeec31bc13de061d313d5c7b069394b86d",
-      "bytes": 7682
+      "sha256": "f063d8ef43205bd11a6ae112d2ec32c42f48f734ff3a0329d3d1ce8d1ef91c83",
+      "bytes": 7697
     },
     {
       "path": "source/requirements.txt",
@@ -65,7 +65,7 @@
     },
     {
       "path": "source/somatic_core/runtime.py",
-      "sha256": "d8bc6f9193c8b8ef3658e638c48144a458d55f2fe502b958a1c78583c800c44d",
+      "sha256": "ccfd9e56d413c125a693f36164dcff87595564e2bd039752d3d9e74c825bbbc4",
       "bytes": 60142
     },
     {
@@ -85,8 +85,8 @@
     },
     {
       "path": "source/somatic_core/skills.py",
-      "sha256": "d8032a8c4d7b82a973e2a19acfce437965fe48a3088936b5f7f51b1d4ea2753b",
-      "bytes": 21283
+      "sha256": "8df77989c0ed8d42892e6e6e22248bf691e76abf88162f53b3ebf591f159858a",
+      "bytes": 24651
     },
     {
       "path": "source/somatic_core/somatic_train_worker.py",

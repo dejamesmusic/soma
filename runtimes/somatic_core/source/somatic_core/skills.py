@@ -43,7 +43,7 @@ from collections import OrderedDict, deque
 from pathlib import Path
 from typing import Callable
 
-UA = "soma/1.5.1 (somatic core; +https://logossoma.com/about)"
+UA = "soma/1.5.2 (somatic core; +https://logossoma.com/about)"
 ROBOT_NAME = "soma"
 URL_RE = re.compile(r"https?://[^\s<>\"'`|\\^{}]+")
 FENCE_RE = re.compile(r"```[ \t]*(?:python|py)?[ \t]*\n(.*?)```\s*$", re.S | re.I)
@@ -55,6 +55,8 @@ REDIRECTS = 5
 SEEN_MAX = 20_000
 TEXT_TYPES = ("text/", "application/json", "application/xml", "application/xhtml", "application/rss", "application/atom")
 SANDBOX = Path(__file__).resolve().parent / "sandbox"
+MEDIA_MAX = 40
+EXCERPT_CHARS = 3000
 STARTUP_NOISE = ("Could not find platform dependent libraries", "WARN: Could not find the platform standard library")
 
 
@@ -154,10 +156,43 @@ class _Text(html.parser.HTMLParser):
         self.base, self.out, self.links, self.title = base, [], [], ""
         self.skip, self.in_title = 0, False
         self.main, self.main_out, self.main_links = 0, [], []      # a page's <main> or <article>, when it has one
+        self.media: list = []                                          # 1.5.2: images and videos, where they appear
+        self.in_video = None
+
+    def _put(self, s: str) -> None:
+        self.out.append(s)
+        if self.main:
+            self.main_out.append(s)
+
+    def _media(self, kind: str, src: str, alt: str) -> None:
+        """an image or a video, in the text where it appears: [image: alt](url). the model reads the alt text there;
+        the chat shows the picture there"""
+        src = urllib.parse.urljoin(self.base, (src or "").strip())
+        if not src.startswith(("http://", "https://")) or len(self.media) >= MEDIA_MAX or any(m["src"] == src for m in self.media):
+            return
+        alt = re.sub(r"\s+", " ", alt or "").strip()[:200]
+        self.media.append({"kind": kind, "src": src, "alt": alt})
+        self._put(f"\n[{kind}: {alt or kind}]({src})\n")
 
     def handle_starttag(self, tag, attrs):
-        if tag in ("main", "article") or dict(attrs).get("role") == "main":
+        a = dict(attrs)
+        if tag in ("main", "article") or a.get("role") == "main":
             self.main += 1
+        if not self.skip:
+            if tag == "img":
+                small = any((a.get(k) or "").isdigit() and int(a[k]) < 40 for k in ("width", "height"))
+                src = a.get("src") or a.get("data-src") or (a.get("srcset") or "").split(" ")[0]
+                if src and not small and not src.startswith("data:"):
+                    self._media("image", src, a.get("alt") or a.get("title") or "")
+            elif tag == "video":
+                self.in_video = {"title": a.get("title") or a.get("aria-label") or "", "got": bool(a.get("src"))}
+                if a.get("src"):
+                    self._media("video", a["src"], self.in_video["title"])
+            elif tag == "source" and self.in_video is not None and not self.in_video["got"] and a.get("src"):
+                self.in_video["got"] = True                      # one video per <video>: its first source
+                self._media("video", a["src"], self.in_video["title"])
+            elif tag == "iframe" and re.match(r"https?://(www\.)?(youtube(-nocookie)?\.com/embed/|player\.vimeo\.com/video/)", urllib.parse.urljoin(self.base, a.get("src") or "")):
+                self._media("video", a.get("src") or "", a.get("title") or "")
         if tag in self.SKIP:
             self.skip += 1
         if tag == "title":
@@ -180,6 +215,8 @@ class _Text(html.parser.HTMLParser):
                     self.main_links.append(link)
 
     def handle_endtag(self, tag):
+        if tag == "video":
+            self.in_video = None
         if tag in ("main", "article") and self.main:
             self.main -= 1
         if tag in self.SKIP and self.skip:
@@ -201,14 +238,14 @@ class _Text(html.parser.HTMLParser):
 
 
 def page_text(url: str, ctype: str, data: bytes) -> tuple:
-    """-> (text, links)"""
+    """-> (text, links, media)"""
     charset = (re.search(r"charset=([\w-]+)", ctype) or [None, "utf-8"])[1]
     try:
         raw = data.decode(charset, errors="replace")
     except LookupError:
         raw = data.decode("utf-8", errors="replace")
     if "html" not in ctype and not raw.lstrip()[:200].lower().startswith(("<!doctype html", "<html")):
-        return raw[:PAGE_CHARS], [u for u in dict.fromkeys(URL_RE.findall(raw))][:LINKS_MAX]
+        return raw[:PAGE_CHARS], [u for u in dict.fromkeys(URL_RE.findall(raw))][:LINKS_MAX], []
     p = _Text(url)
     try:
         p.feed(raw)
@@ -223,7 +260,9 @@ def page_text(url: str, ctype: str, data: bytes) -> tuple:
     head = (html.unescape(p.title.strip()) + "\n") if p.title.strip() else ""
     host = urllib.parse.urlsplit(url).hostname or ""
     links = sorted(links, key=lambda u: (urllib.parse.urlsplit(u).hostname or "") != host)   # the site's own first
-    return (head + text)[:PAGE_CHARS], links[:LINKS_MAX]
+    text = (head + text)[:PAGE_CHARS]
+    media = [{k: v for k, v in m.items() if not k.startswith("_")} for m in p.media if m["src"] in text]
+    return text, links[:LINKS_MAX], media
 
 
 # ------------------------------------------------------------------ run: python in webassembly
@@ -306,6 +345,7 @@ class Skills:
         self.settings.update(settings or {})
         self.on_event = on_event
         self.seen: OrderedDict = OrderedDict()
+        self.media: OrderedDict = OrderedDict()          # 1.5.2: images and videos it has read: url -> {kind, alt}
         self.hour: deque = deque()
         self.turn = {"look": 0, "run": 0}
         self.last_at: dict = {}
@@ -327,6 +367,17 @@ class Skills:
     def forget(self) -> None:
         """a new chat: links read in another chat don't carry over"""
         self.seen.clear()
+        self.media.clear()
+
+    def media_in(self, text: str) -> list:
+        """images and videos it has read that it shows in what it wrote (the chat shows them)"""
+        out = []
+        for url in URL_RE.findall(text or ""):
+            url = url.rstrip(".,;:!?)]}'\"")
+            m = self.media.get(url)
+            if m and not any(x["src"] == url for x in out):
+                out.append({"src": url, **m})
+        return out[:MEDIA_MAX]
 
     def new_turn(self) -> None:
         self.turn = {"look": 0, "run": 0}
@@ -409,12 +460,20 @@ class Skills:
         final, ctype, data = http_get(url, allow_private=self.settings["allow_private"])
         if ctype and not ctype.startswith(TEXT_TYPES):
             raise Refusal(f"that link is {ctype.split(';')[0]}, not text")
-        text, links = page_text(final, ctype, data)
+        text, links, media = page_text(final, ctype, data)
         self.observe(final)
         for link in links:
             self.observe(link)
+        for m in media:
+            self.media[m["src"]] = {"kind": m["kind"], "alt": m["alt"]}
+            self.media.move_to_end(m["src"])
+            self.seen[m["src"]] = True
+        while len(self.media) > SEEN_MAX:
+            self.media.popitem(last=False)
         body = f"{final}\n\n{text}\n" + (("\nlinks:\n" + "\n".join(f"- {u}" for u in links) + "\n") if links else "")
-        self._event("skill", kind="fetch", ok=True, what=final, bytes=len(body.encode()))
+        excerpt = text[:EXCERPT_CHARS]
+        self._event("skill", kind="fetch", ok=True, what=final, bytes=len(body.encode()), excerpt=excerpt,
+                    media=[m for m in media if m["src"] in excerpt] + [m for m in media if m["src"] not in excerpt][:8])
         return body
 
     def _search(self, query: str) -> str:

@@ -1,11 +1,11 @@
 {
  "bundle": {
-  "bytes": 14623206,
-  "name": "soma-somatic-core-1.5.1.tar.gz",
-  "sha256": "5bb998efc80d4ab543f6d392ca0844b3fe6f2a128abc14c7d2ab8fd4eabe6135"
+  "bytes": 14624115,
+  "name": "soma-somatic-core-1.5.2.tar.gz",
+  "sha256": "6c85ca990a391a9c9e362f63cf3ebf575904f60166e3b75a91d17cbb671cac76"
  },
- "lock_digest": "0d431d94e2db51644663b2eff55c4e5a3116f59cbdd00d853134272163be12d5",
- "notes": "somatic core 1.5.1: run is installed. a model's code runs in python 3.15 compiled to webassembly (cpython's wasi build), inside the runtime: no network, no files but a scratch folder emptied after each run and the standard library read-only, 10 seconds, 256 MB, 20 KB of output. wasmtime is installed beside the runtime when it can be; without it, run says so. everything else is 1.5.0.",
+ "lock_digest": "f24558f409425310791b7661143fc1da3601038ea8c25e824febd7fbb51ac63b",
+ "notes": "somatic core 1.5.2: pages keep their pictures and videos. a fetched page's images and videos stay where they appear, as [image: alt](link) in the text the model reads (menus, icons and repeats left out), so it reads what a picture is of where it is, and can show one it has read by writing its link. the chat draws them. everything else is 1.5.1.",
  "opens": [
   "0.1.0",
   "0.1.1",
@@ -21,7 +21,8 @@
   "1.3.0",
   "1.4.0",
   "1.5.0",
-  "1.5.1"
+  "1.5.1",
+  "1.5.2"
  ],
  "optional_python": {
   "numba": ">=0.60",
@@ -37,5 +38,5 @@
  },
  "runtime_id": "soma.somatic_core",
  "statement": 1,
- "version": "1.5.1"
+ "version": "1.5.2"
 }
