@@ -1,17 +1,17 @@
 {
   "lockVersion": 1,
-  "runtime": "soma.somatic_core@1.5.0",
-  "digest": "157417fc3dad89783d268367648c3dd0da0a6f2d365e8a81e838709ae6d0937d",
+  "runtime": "soma.somatic_core@1.5.1",
+  "digest": "0d431d94e2db51644663b2eff55c4e5a3116f59cbdd00d853134272163be12d5",
   "files": [
     {
       "path": "runtime.json",
-      "sha256": "c46cd9011b1619010768269f236ba931319945691ab8bc260b29db51a47d6c4a",
-      "bytes": 7667
+      "sha256": "c94587f7e4a2419f4cb06f9837ed60aeec31bc13de061d313d5c7b069394b86d",
+      "bytes": 7682
     },
     {
       "path": "source/requirements.txt",
-      "sha256": "ec6214bf1aea325cda928414be8c20216154fbd9d23d06d7849e1499cc1d2831",
-      "bytes": 63
+      "sha256": "a9c8aa79c96a3381a8f5081d435af3844cf38b0b04a9e6d55c8e9fbce465a35b",
+      "bytes": 80
     },
     {
       "path": "source/somatic_core/__init__.py",
@@ -65,13 +65,28 @@
     },
     {
       "path": "source/somatic_core/runtime.py",
-      "sha256": "21df7469ddc89ac97d337df3527bcc802c9eb90d7598dfbc4867074b9762df5e",
+      "sha256": "d8bc6f9193c8b8ef3658e638c48144a458d55f2fe502b958a1c78583c800c44d",
       "bytes": 60142
     },
     {
+      "path": "source/somatic_core/sandbox/LICENSE-cpython",
+      "sha256": "b0e25a78cffb43f4d92de8b61ccfa1f1f98ecbc22330b54b5251e7b6ba010231",
+      "bytes": 13804
+    },
+    {
+      "path": "source/somatic_core/sandbox/lib/python315.zip",
+      "sha256": "5a47deab92114f0d0d3ad4dbcf8a0a4cfb78e13c467129001eeebbd4540b7e70",
+      "bytes": 9687517
+    },
+    {
+      "path": "source/somatic_core/sandbox/python.wasm",
+      "sha256": "dd076791fb6d1286a5dfe105852dfb3367e10562de68ca0a618e615625cdf636",
+      "bytes": 32444705
+    },
+    {
       "path": "source/somatic_core/skills.py",
-      "sha256": "e8a3905198e5354a1b92285eecc4b5fea72a0d9bd9d13d09c120d981b1f802bf",
-      "bytes": 21307
+      "sha256": "d8032a8c4d7b82a973e2a19acfce437965fe48a3088936b5f7f51b1d4ea2753b",
+      "bytes": 21283
     },
     {
       "path": "source/somatic_core/somatic_train_worker.py",

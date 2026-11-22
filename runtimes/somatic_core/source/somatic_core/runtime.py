@@ -46,7 +46,7 @@ except ImportError:                                                     # as scr
 
 SPECIES = "somatic_core"
 RUNTIME_ID = "soma.somatic_core"
-RUNTIME_VERSION = "1.5.0"
+RUNTIME_VERSION = "1.5.1"
 SESSION_FILE = "soma_state"                                               # the control that opens a file in a session
 CHECKPOINT_FORMAT = "somatic-core-pytorch"
 CHECKPOINT_VERSION = 1

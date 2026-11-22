@@ -43,7 +43,7 @@ from collections import OrderedDict, deque
 from pathlib import Path
 from typing import Callable
 
-UA = "soma/1.5 (somatic core; +https://logossoma.com/about)"
+UA = "soma/1.5.1 (somatic core; +https://logossoma.com/about)"
 ROBOT_NAME = "soma"
 URL_RE = re.compile(r"https?://[^\s<>\"'`|\\^{}]+")
 FENCE_RE = re.compile(r"```[ \t]*(?:python|py)?[ \t]*\n(.*?)```\s*$", re.S | re.I)
@@ -55,6 +55,7 @@ REDIRECTS = 5
 SEEN_MAX = 20_000
 TEXT_TYPES = ("text/", "application/json", "application/xml", "application/xhtml", "application/rss", "application/atom")
 SANDBOX = Path(__file__).resolve().parent / "sandbox"
+STARTUP_NOISE = ("Could not find platform dependent libraries", "WARN: Could not find the platform standard library")
 
 
 class Refusal(Exception):
@@ -228,7 +229,7 @@ def page_text(url: str, ctype: str, data: bytes) -> tuple:
 # ------------------------------------------------------------------ run: python in webassembly
 
 def sandbox_ready() -> bool:
-    return (SANDBOX / "python.wasm").is_file() and (SANDBOX / "lib").is_dir() and _wasmtime() is not None
+    return (SANDBOX / "python.wasm").is_file() and (SANDBOX / "lib" / "python315.zip").is_file() and _wasmtime() is not None
 
 
 def _wasmtime():
@@ -251,19 +252,9 @@ def run_python(code: str, *, seconds: float = 10.0, memory: int = 256 * 1024 ** 
     if "engine" not in _MODULE:
         cfg = wt.Config()
         cfg.epoch_interruption = True
-        cfg.cache = False
         engine = wt.Engine(cfg)
-        compiled = SANDBOX / f"python.{wt.__version__}.cwasm"
-        try:
-            module = wt.Module.deserialize_file(engine, str(compiled)) if compiled.is_file() else None
-        except Exception:                                # noqa: BLE001 - compiled by another version: compile again
-            module = None
-        if module is None:
-            module = wt.Module.from_file(engine, str(SANDBOX / "python.wasm"))
-            try:
-                compiled.write_bytes(module.serialize())
-            except OSError:
-                pass
+        # compiled once per process, in memory: a precompiled module is native code, so none is ever read from disk
+        module = wt.Module.from_file(engine, str(SANDBOX / "python.wasm"))
         _MODULE.update(engine=engine, module=module)
     engine, module = _MODULE["engine"], _MODULE["module"]
     scratch = Path(tempfile.mkdtemp(prefix="soma-run-"))
@@ -272,9 +263,9 @@ def run_python(code: str, *, seconds: float = 10.0, memory: int = 256 * 1024 ** 
         out, err = scratch / ".out", scratch / ".err"
         wasi = wt.WasiConfig()
         wasi.argv = ["python", "-I", "-B", "/work/main.py"]
-        wasi.env = [["PYTHONHOME", "/lib"], ["PYTHONDONTWRITEBYTECODE", "1"], ["HOME", "/work"]]
-        wasi.preopen_dir(str(SANDBOX / "lib"), "/lib", wt.DirPerms.READ_ONLY, wt.FilePerms.READ_ONLY)
-        wasi.preopen_dir(str(scratch), "/work")
+        wasi.env = [["PYTHONHOME", "/"], ["PYTHONDONTWRITEBYTECODE", "1"], ["HOME", "/work"]]   # stdlib: /lib/python315.zip
+        wasi.preopen_dir(str(SANDBOX / "lib"), "/lib", False)               # the standard library, read-only
+        wasi.preopen_dir(str(scratch), "/work", True)                      # its scratch folder, emptied after
         wasi.stdout_file, wasi.stderr_file = str(out), str(err)
         store = wt.Store(engine)
         store.set_limits(memory_size=memory)
@@ -297,6 +288,7 @@ def run_python(code: str, *, seconds: float = 10.0, memory: int = 256 * 1024 ** 
             timer.cancel()
         text = out.read_text(errors="replace") if out.exists() else ""
         errs = err.read_text(errors="replace") if err.exists() else ""
+        errs = "".join(x for x in errs.splitlines(True) if not x.startswith(STARTUP_NOISE))   # the build's own path notes
         body = text + (("\n" if text and not text.endswith("\n") else "") + errs if errs else "") + note
         return body[:output] + ("\n(output cut at 20 KB)" if len(body) > output else "")
     finally:
