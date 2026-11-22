@@ -1,4 +1,4 @@
-# somatic core 1.2.1: runtime specification
+# somatic core: runtime specification (1.2.1; what 1.5.0 adds is §13)
 
 *Runtime `soma.somatic_core`, species `somatic_core`, checkpoint format `somatic-core-pytorch` (checkpoint version 1),
 tokenizer soma-8k-v1 (8192 tokens). Theory: `THEORY.md`. Measurements: `RESULTS.md`.*
@@ -237,3 +237,26 @@ bytes/s) and its peak from 7.7 GB to 6.1 GB; chat went from about 100 ms to 19�
   - io2's ratio, energy, coherence and band;
   - `residual_spectrum` / `residual_baseline` / `residual_excess` by band;
   - the surprise of recent tokens and the top predictions.
+
+## 13. Reading turns and skills (1.5.0)
+
+Nothing in the architecture, the state or the checkpoint changes; 1.5.0 changes what happens at two tokens.
+
+- **Reading turns** (James, Nov 22). While a file is read, wherever the model's most likely next token is its own turn
+  (`<|soma|>`), it takes the turn exactly there: `<|soma|>`, a reply of up to its length, `<|turn|>`, then
+  `<|soma_state|>`, and the file goes on from that token. Each tick is checked before it is learned: the same tick is
+  read without learning on a copy of the stream (an exact copy of its matcher; the store and weights untouched), and the
+  first file position whose argmax is `<|soma|>` is taken. A position is taken at most once. The check costs one extra
+  forward pass per tick, with no backward. A score never interrupts; force read (an engine setting)
+  reads straight through.
+- **Skills.** While it writes, wherever its most likely next token is `<|soma_state|>` (a file begins), the model has
+  asked for a file. What it wrote since its turn began (or its last file) decides what it gets: a link it has read →
+  that page as text, with its links; a code block at its end → what the code printed (python in a webassembly sandbox,
+  no network, 10 s, 256 MB); anything else → search results for its last line. The answer is read in as a file and
+  `<|soma|>` gives it the turn back; files don't count toward its length; at most 16 asks a turn. The crawler reaches
+  only public addresses (checked on the address connected to, every redirect), honours robots.txt, takes one request a
+  second per site, and follows only links the model has read (typed to it, in a file, a page or search results), so it
+  can't carry a conversation out inside a link it made up. Caps: 3 fetches or searches a turn, 30 an hour, 10 runs a
+  turn. Skills run where the model runs, and are off unless an engine turns them on (`enable_skills`).
+- **The vocabulary is unchanged**: both triggers use controls the tokenizer already has, so every model can learn them.
+

@@ -691,6 +691,7 @@ class Core3(Core2):
             self.acc[4] += (pfull.argmax(-1) == y).float().sum()
             self.acc[5] += C
         self.last = dict(tokens=ys, bits=-torch.log2(pf), exact=-lyE.detach() / math.log(2), next=pfull[-1].topk(5),
+                         argmax=pfull.argmax(-1),                     # 1.5.0: each position's most likely token (reading turns)
                          learner=-lyL.detach() / math.log(2), deep=deep)          # deep: the store's deepest known order, per token
         if getattr(self, 'probe', None) is not None and not cnt_:   # before any learning from this tick
             self.probe(self, y, sg, lpE.detach(), lpL.detach())

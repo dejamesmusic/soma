@@ -37,14 +37,16 @@ try:
     from .core import Matcher
     from .core3 import Core3
     from .data import FORBIDDEN, Stream, byte_lengths, encode_bytes, read_segment, tokenizer
+    from .skills import Skills
 except ImportError:                                                     # as scripts in this folder
     from core import Matcher
     from core3 import Core3
     from data import FORBIDDEN, Stream, byte_lengths, encode_bytes, read_segment, tokenizer
+    from skills import Skills
 
 SPECIES = "somatic_core"
 RUNTIME_ID = "soma.somatic_core"
-RUNTIME_VERSION = "1.4.0"
+RUNTIME_VERSION = "1.5.0"
 SESSION_FILE = "soma_state"                                               # the control that opens a file in a session
 CHECKPOINT_FORMAT = "somatic-core-pytorch"
 CHECKPOINT_VERSION = 1
@@ -326,6 +328,17 @@ class SOMA:
         self.life = dict(bytes=0, tokens=0, bits_exact=0.0, bits_learner=0.0, bits_final=0.0, scored_bytes=0.0)
         self.sampler = torch.Generator(device="cpu")
         self.sampler.manual_seed(self.seed)
+        self.skills: Skills | None = None                                # 1.5.0: search and run, when the engine turns them on
+
+    def enable_skills(self, settings: dict | None = None, on_event=None) -> Skills:
+        """1.5.0: the model's two skills (skills.py). Off until an engine turns them on; settings change any time."""
+        if self.skills is None:
+            self.skills = Skills(settings, on_event)
+        else:
+            self.skills.settings.update(settings or {})
+            if on_event is not None:
+                self.skills.on_event = on_event
+        return self.skills
 
     # ---- basic properties ----
     @property
@@ -649,15 +662,23 @@ class SOMA:
 
     def session_text(self, text, online=False):
         """typed words: <|user|> text"""
+        if self.skills is not None:
+            self.skills.observe(str(text))
         self._chat_window()
         body = np.asarray(encode_bytes(self.tokenizer, str(text).encode("utf-8")), np.int64)
         self._feed(np.concatenate([np.asarray([self.tokenizer.control_ids["user"]], np.int64), body]), learn=bool(online))
         self._learned_into()
 
-    def session_file(self, path, online=True, report_every=1, report_callback=None, stop_callback=None):
+    def session_file(self, path, online=True, report_every=1, report_callback=None, stop_callback=None, turns=None):
         """a file: <|soma_state|> then its bytes once, start to end, in the stream's ticks (nothing after its end: a
         training pass wraps to fill its last tick, which here would put the file's opening after its end).
-        -> the read's totals (bytes, tokens and bits of the ticks it completed)"""
+        -> the read's totals (bytes, tokens and bits of the ticks it completed)
+
+        1.5.0, reading turns (James, Nov 22): with turns = {"length", "temperature", "on_turn"}, wherever the model's most
+        likely next token is its own turn (<|soma|>), exactly there, it takes it: <|soma|>, a reply of up to `length`
+        tokens (on_turn(characters) hears it as it comes), <|turn|>, then <|soma_state|> and the file goes on from that
+        token. Each tick is checked before it is learned, by the same read without learning on a copy of the stream;
+        a position is taken at most once. turns=None (force read on, or a score) reads straight through."""
         path = Path(path).expanduser().resolve()
         assert not any(w in path.name.lower() for w in FORBIDDEN), "never read iMessage-derived data"
         size = path.stat().st_size
@@ -666,13 +687,33 @@ class SOMA:
         shim.bytes_read, shim.wraps = np.zeros(1, np.int64), np.zeros(1, np.int64)
         session, window = dict(bytes=0.0, tokens=0, batches=0), dict(bytes=0.0)
         started, reported = time.time(), 0
+        C = int(self.config.chunk)
+        fed, held = 0, -1                                    # file tokens fed; a position its turn was just taken at
         with path.open("rb") as f:
             while not (stop_callback and stop_callback()):
                 raw = read_segment(f, size, 4096)
                 if not raw:
                     break
                 shim.bytes_read[0] += len(raw)
-                self._feed(encode_bytes(self.tokenizer, raw), learn=bool(online), totals=(session, window), read=False)
+                if self.skills is not None:
+                    self.skills.observe_bytes(raw)
+                ids = encode_bytes(self.tokenizer, raw)
+                if turns is None:
+                    self._feed(ids, learn=bool(online), totals=(session, window), read=False)
+                else:
+                    pos = 0
+                    while pos < len(ids) and not (stop_callback and stop_callback()):
+                        piece = ids[pos:pos + max(1, C - len(self.pending))]
+                        j = self._first_turn(piece, skip_first=fed == held)
+                        if j is None:
+                            self._feed(piece, learn=bool(online), totals=(session, window), read=False)
+                            pos, fed = pos + len(piece), fed + len(piece)
+                            continue
+                        if j:
+                            self._feed(piece[:j], learn=bool(online), totals=(session, window), read=False)
+                            pos, fed = pos + j, fed + j
+                        self._turn_while_reading(turns, online)
+                        held = fed
                 if report_every and session["batches"] - reported >= int(report_every):
                     reported = session["batches"]
                     self._learned_into(window, session)
@@ -683,6 +724,53 @@ class SOMA:
         self._chat_window()
         session["file_bytes"] = int(shim.bytes_read[0])
         return session
+
+    def _first_turn(self, piece, skip_first=False):
+        """the first token of `piece` (file tokens about to join the stream) before which the model's most likely next
+        token is its own turn -> its index, or None. The tick it will be learned in (the pending tail and these tokens)
+        is read without learning on a copy of the stream: the same predictions the learning tick makes."""
+        piece = np.asarray(piece, np.int64)
+        if not len(piece):
+            return None
+        off = len(self.pending)
+        ys = np.concatenate([self.pending, piece]) if off else piece
+        core = self.core
+        acc, last = core.acc.clone(), core.last
+        try:
+            core.step(self.stream_ctx.copy(), ys, learn=False)
+            am = core.last.get("argmax")
+        finally:
+            core.acc.copy_(acc)
+            core.last = last
+        if am is None:
+            return None
+        hits = (am[off:] == self.tokenizer.control_ids["soma"]).nonzero()
+        for h in hits.reshape(-1).tolist():
+            if not (skip_first and h == 0):
+                return int(h)
+        return None
+
+    def _turn_while_reading(self, turns, online):
+        """its turn, where it took it: <|soma|>, its words, <|turn|>, then back to the file with <|soma_state|>"""
+        self._mark("soma", online)
+        stream = self.generate(length=int(turns.get("length", 200)), temperature=float(turns.get("temperature", 0.8)),
+                               learn=bool(online))
+        try:
+            if turns.get("on_turn"):
+                turns["on_turn"](stream)
+            else:
+                for _ in stream:
+                    pass
+        finally:
+            stream.close()                                   # a reply cut short still closes with <|turn|>
+        self._mark(SESSION_FILE, online)
+
+    def _read_bytes(self, data: bytes, online):
+        """a file the model asked for (a page, results, a run's output): <|soma_state|> then its bytes, in the stream"""
+        self._mark(SESSION_FILE, online)
+        self._feed(encode_bytes(self.tokenizer, data), learn=bool(online), read=False)
+        self._learned_into()
+        self._chat_window()
 
     def session_reply(self, online=False):
         """the reply begins: <|soma|> (generate() then samples until <|turn|> or its length)"""
@@ -695,13 +783,23 @@ class SOMA:
 
     def _generation_tokens(self, length, temperature, ctx=None, learn=True):
         """samples; in the reading context each one joins the stream (and is learned when its tick fills, like any
-        other token). A sample from a copy of a context (ctx given) stays there."""
+        other token). A sample from a copy of a context (ctx given) stays there.
+
+        1.5.0, skills: in the stream, with skills on, wherever the most likely next token is <|soma_state|> (a file
+        begins), the model has asked for a file: what it wrote since its turn began (or its last file) goes to
+        skills.request, the answer is read in as a file, and <|soma|> gives it its turn back. Files don't count toward
+        `length`; at most 16 asks a turn."""
         stream = ctx is None
         if stream:
             self._chat_window()
         ctx = self.chat_ctx if ctx is None else ctx
         forbidden = list(self.tokenizer.generation_forbidden_ids)
         turn = self.tokenizer.control_ids["turn"]
+        asks_file = self.tokenizer.control_ids[SESSION_FILE]
+        skills = self.skills if stream else None
+        if skills is not None:
+            skills.new_turn()
+        written, asks = [], 0
         ended = False
 
         def take(t):
@@ -712,13 +810,24 @@ class SOMA:
             else:
                 self.core.observe(ctx, [t])
         try:
-            for _ in range(int(length)):
+            made = 0
+            while made < int(length):
                 c = self.chat_ctx if stream else ctx
-                t = self._sample(self.core.next_distribution(c), float(temperature), forbidden)
+                p = self.core.next_distribution(c)
+                if skills is not None and asks < 16 and int(torch.argmax(p)) == asks_file:
+                    asks += 1
+                    answer = skills.request(self.tokenizer.decode(written))
+                    self._read_bytes(answer.encode("utf-8"), learn)
+                    self._mark("soma", learn)
+                    written = []
+                    continue
+                t = self._sample(p, float(temperature), forbidden)
                 take(t)
+                made += 1
                 if t == turn:
                     ended = True
                     break
+                written.append(t)
                 yield t
         finally:
             if not ended:

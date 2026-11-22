@@ -1,11 +1,11 @@
 {
  "bundle": {
-  "bytes": 182565,
-  "name": "soma-somatic-core-1.4.0.tar.gz",
-  "sha256": "d337fdf0b7d138d6cd9ba8303430f33eeafa191cb15295a93169fb239c68eeb2"
+  "bytes": 191738,
+  "name": "soma-somatic-core-1.5.0.tar.gz",
+  "sha256": "80ff40d0ef3fe7f0ced48a5832dc3353563bdb56e36e0d41819dec9037fcd0bc"
  },
- "lock_digest": "68ae65893426eb9b7592084ab3ec8e620bd9bbd904b69466fcf3ff7248ee40b2",
- "notes": "somatic core 1.4.0: the settled release. one architecture and one checkpoint format (CHECKPOINT.md), opening every somatic core model from 0.1.0 on. the store's fast timescales now read exact ages at any clock (they were rounded by up to 64 tokens past ~16M tokens of life), and no prediction depends on anything after it, even while the store evicts. chat reads the attention window training built (replies were reading one token on rope models). slim copies without optimiser state for sharing. the compiled store path runs wherever numba is installed. updates now arrive through the app.",
+ "lock_digest": "157417fc3dad89783d268367648c3dd0da0a6f2d365e8a81e838709ae6d0937d",
+ "notes": "somatic core 1.5.0: a model takes its turn while it reads, exactly where it predicts it (force read on waits for a real turn), then goes back to the file. its two skills, search and run: where its most likely next token opens a file, it gets one: a page it has a link to, search results, or what its code printed. the crawler follows only links the model has read, reaches only public addresses, honours robots.txt and is capped per turn and per hour; run is python in a sandbox with no network, installed separately. checkpoints are unchanged: every somatic core model opens.",
  "opens": [
   "0.1.0",
   "0.1.1",
@@ -19,13 +19,14 @@
   "1.2.0",
   "1.2.1",
   "1.3.0",
-  "1.4.0"
+  "1.4.0",
+  "1.5.0"
  ],
  "optional_python": {
   "numba": ">=0.60",
   "pytest": ">=8"
  },
- "released_on": "2026-11-19",
+ "released_on": "2026-11-22",
  "requires_app": "1.2.0",
  "requires_python": {
   "numpy": ">=2.0",
@@ -34,5 +35,5 @@
  },
  "runtime_id": "soma.somatic_core",
  "statement": 1,
- "version": "1.4.0"
+ "version": "1.5.0"
 }

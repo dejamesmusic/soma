@@ -128,6 +128,9 @@ class PyMatcher:
         m.ready, m.cur = bool(s["ready"]), (int(s["cur"][0]), int(s["cur"][1]))
         return m
 
+    def copy(self) -> "Matcher":
+        return type(self).from_state(self.state())
+
     def clone(self) -> "Matcher":
         c = type(self).from_state(self.state())
         g = getattr(self, "_gen", None)              # a generation window travels with its context (Nov 18): the copy
@@ -186,6 +189,13 @@ class JitMatcher(PyMatcher):
         keys = np.stack([(kk >> (16 * i)) & 0xFFFF for i in range(self.minl)], 1).astype(np.int64)
         return dict(ring=self.ring, minl=self.minl, R=self.R.copy(), t=self.t, mp=self.mp, ml=self.ml,
                     keys=keys, vals=vv.copy(), tail=np.array(self.tail, np.int64), ready=self.ready, cur=list(self.cur))
+
+    def copy(self) -> "JitMatcher":
+        """1.5.0: an exact copy by its arrays (a reading turn's check reads a tick on a copy of the stream)"""
+        c = type(self).__new__(type(self))
+        c.ring, c.minl = self.ring, self.minl
+        c.R, c.ms, c.lk, c.lv = self.R.copy(), self.ms.copy(), self.lk.copy(), self.lv.copy()
+        return c
 
     @classmethod
     def from_state(cls, s: dict) -> "JitMatcher":
