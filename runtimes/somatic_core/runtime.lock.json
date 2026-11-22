@@ -1,12 +1,12 @@
 {
   "lockVersion": 1,
-  "runtime": "soma.somatic_core@1.5.2",
-  "digest": "f24558f409425310791b7661143fc1da3601038ea8c25e824febd7fbb51ac63b",
+  "runtime": "soma.somatic_core@1.5.3",
+  "digest": "ce3bbf0f7acd89a4bf23d208b083174fb9017f8e9b2f5c38d67640052d65c1dd",
   "files": [
     {
       "path": "runtime.json",
-      "sha256": "f063d8ef43205bd11a6ae112d2ec32c42f48f734ff3a0329d3d1ce8d1ef91c83",
-      "bytes": 7697
+      "sha256": "e6ef6a017271d0874c2cbd97ee2ab72f75e184404efe6588f795d6eeac394d38",
+      "bytes": 7726
     },
     {
       "path": "source/requirements.txt",
@@ -65,8 +65,8 @@
     },
     {
       "path": "source/somatic_core/runtime.py",
-      "sha256": "ccfd9e56d413c125a693f36164dcff87595564e2bd039752d3d9e74c825bbbc4",
-      "bytes": 60142
+      "sha256": "08bd60a7eacb1159a4eb6533d19bb504262d613f65c328d31eee8077b8c5d56d",
+      "bytes": 63408
     },
     {
       "path": "source/somatic_core/sandbox/LICENSE-cpython",
@@ -85,7 +85,7 @@
     },
     {
       "path": "source/somatic_core/skills.py",
-      "sha256": "8df77989c0ed8d42892e6e6e22248bf691e76abf88162f53b3ebf591f159858a",
+      "sha256": "650126a551fc4f1215a82357d7f9889f6e218e6fc3aacc08784b7e29569938a3",
       "bytes": 24651
     },
     {

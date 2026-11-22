@@ -43,7 +43,7 @@ from collections import OrderedDict, deque
 from pathlib import Path
 from typing import Callable
 
-UA = "soma/1.5.2 (somatic core; +https://logossoma.com/about)"
+UA = "soma/1.5.3 (somatic core; +https://logossoma.com/about)"
 ROBOT_NAME = "soma"
 URL_RE = re.compile(r"https?://[^\s<>\"'`|\\^{}]+")
 FENCE_RE = re.compile(r"```[ \t]*(?:python|py)?[ \t]*\n(.*?)```\s*$", re.S | re.I)

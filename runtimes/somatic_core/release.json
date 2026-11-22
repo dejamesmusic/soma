@@ -1,11 +1,11 @@
 {
  "bundle": {
-  "bytes": 14624115,
-  "name": "soma-somatic-core-1.5.2.tar.gz",
-  "sha256": "6c85ca990a391a9c9e362f63cf3ebf575904f60166e3b75a91d17cbb671cac76"
+  "bytes": 14625429,
+  "name": "soma-somatic-core-1.5.3.tar.gz",
+  "sha256": "b7564b05d48b33bf1047d71311872e627be4e326739bc9266ebac06fa5c220d3"
  },
- "lock_digest": "f24558f409425310791b7661143fc1da3601038ea8c25e824febd7fbb51ac63b",
- "notes": "somatic core 1.5.2: pages keep their pictures and videos. a fetched page's images and videos stay where they appear, as [image: alt](link) in the text the model reads (menus, icons and repeats left out), so it reads what a picture is of where it is, and can show one it has read by writing its link. the chat draws them. everything else is 1.5.1.",
+ "lock_digest": "ce3bbf0f7acd89a4bf23d208b083174fb9017f8e9b2f5c38d67640052d65c1dd",
+ "notes": "somatic core 1.5.3: a model can learn its skills by reading. a file ending .traces.jsonl is read as turns, not text: each line a recorded turn (a person's question, the query or code the model wrote, the file it got back, its answer), written into its stream with the same markers it uses when it lives that turn, and learned as it's read with learning on. everything else is 1.5.2.",
  "opens": [
   "0.1.0",
   "0.1.1",
@@ -22,7 +22,8 @@
   "1.4.0",
   "1.5.0",
   "1.5.1",
-  "1.5.2"
+  "1.5.2",
+  "1.5.3"
  ],
  "optional_python": {
   "numba": ">=0.60",
@@ -38,5 +39,5 @@
  },
  "runtime_id": "soma.somatic_core",
  "statement": 1,
- "version": "1.5.2"
+ "version": "1.5.3"
 }

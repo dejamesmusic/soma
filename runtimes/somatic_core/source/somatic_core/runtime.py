@@ -46,8 +46,10 @@ except ImportError:                                                     # as scr
 
 SPECIES = "somatic_core"
 RUNTIME_ID = "soma.somatic_core"
-RUNTIME_VERSION = "1.5.2"
+RUNTIME_VERSION = "1.5.3"
 SESSION_FILE = "soma_state"                                               # the control that opens a file in a session
+TRACES_SUFFIX = ".traces.jsonl"                                           # 1.5.3: a file of recorded turns, read as turns
+TRACE_SEGMENT_CHARS = 400_000
 CHECKPOINT_FORMAT = "somatic-core-pytorch"
 CHECKPOINT_VERSION = 1
 EPS = 1e-12
@@ -681,6 +683,8 @@ class SOMA:
         a position is taken at most once. turns=None (force read on, or a score) reads straight through."""
         path = Path(path).expanduser().resolve()
         assert not any(w in path.name.lower() for w in FORBIDDEN), "never read iMessage-derived data"
+        if path.name.endswith(TRACES_SUFFIX):
+            return self._session_traces(path, online, report_every, report_callback, stop_callback)
         size = path.stat().st_size
         self._mark(SESSION_FILE, online)
         shim = type("Read", (), {})()
@@ -714,6 +718,56 @@ class SOMA:
                             pos, fed = pos + j, fed + j
                         self._turn_while_reading(turns, online)
                         held = fed
+                if report_every and session["batches"] - reported >= int(report_every):
+                    reported = session["batches"]
+                    self._learned_into(window, session)
+                    if report_callback:
+                        report_callback(self._report(session, window, started, shim, 0, size, 1, np.zeros(1, np.int64)))
+                    window = dict(bytes=0.0)
+        self._learned_into(window, session)
+        self._chat_window()
+        session["file_bytes"] = int(shim.bytes_read[0])
+        return session
+
+    def _trace_ids(self, trace: dict) -> list:
+        """one recorded turn as the stream holds it (1.5.3): <|user|> words, <|soma|> its words, <|soma_state|> a file
+        it got, ... <|turn|>. The same tokens the runtime writes when it lives that turn."""
+        ctl, ids = self.tokenizer.control_ids, []
+        enc = lambda s: [int(x) for x in encode_bytes(self.tokenizer, str(s)[:TRACE_SEGMENT_CHARS].encode("utf-8"))]  # noqa: E731
+        for s in trace.get("segments") or []:
+            who = s.get("who") if isinstance(s, dict) else None
+            if who == "user":
+                ids += [ctl["user"]] + enc(str(s.get("text") or "").strip() + " ")
+            elif who == "soma":
+                ids += [ctl["soma"]] + enc(s.get("text") or "")
+            elif who == "file":
+                ids += [ctl[SESSION_FILE]] + enc(s.get("text") or "")
+        return ids + [ctl["turn"]] if ids else []
+
+    def _session_traces(self, path, online, report_every, report_callback, stop_callback):
+        """1.5.3: a .traces.jsonl file is read as turns, not text: each line a recorded turn ({"segments": [{"who":
+        "user"|"soma"|"file", "text"}]}), written into the stream with its markers, learned as it's read when online.
+        This is how a model learns its skills from examples: a person's question, the query or code it wrote, the file
+        it got back, its answer. Its own turns aren't taken while reading one (the file is turns already)."""
+        size = path.stat().st_size
+        shim = type("Read", (), {})()
+        shim.bytes_read, shim.wraps = np.zeros(1, np.int64), np.zeros(1, np.int64)
+        session, window = dict(bytes=0.0, tokens=0, batches=0, traces=0), dict(bytes=0.0)
+        started, reported = time.time(), 0
+        self._chat_window()
+        with path.open("rb") as f:
+            for raw in f:
+                if stop_callback and stop_callback():
+                    break
+                shim.bytes_read[0] += len(raw)
+                try:
+                    ids = self._trace_ids(json.loads(raw))
+                except (ValueError, AttributeError, TypeError):
+                    continue                                          # not a turn: skipped
+                if not ids:
+                    continue
+                session["traces"] += 1
+                self._feed(np.asarray(ids, np.int64), learn=bool(online), totals=(session, window), read=False)
                 if report_every and session["batches"] - reported >= int(report_every):
                     reported = session["batches"]
                     self._learned_into(window, session)
