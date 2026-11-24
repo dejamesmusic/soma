@@ -1,11 +1,11 @@
 {
  "bundle": {
-  "bytes": 14625429,
-  "name": "soma-somatic-core-1.5.3.tar.gz",
-  "sha256": "b7564b05d48b33bf1047d71311872e627be4e326739bc9266ebac06fa5c220d3"
+  "bytes": 14640610,
+  "name": "soma-somatic-core-1.6.0.tar.gz",
+  "sha256": "eff9b03231333cacc8e879cc544851487c4c756f61a02c8f7c1cfd130f0c349c"
  },
- "lock_digest": "ce3bbf0f7acd89a4bf23d208b083174fb9017f8e9b2f5c38d67640052d65c1dd",
- "notes": "somatic core 1.5.3: a model can learn its skills by reading. a file ending .traces.jsonl is read as turns, not text: each line a recorded turn (a person's question, the query or code the model wrote, the file it got back, its answer), written into its stream with the same markers it uses when it lives that turn, and learned as it's read with learning on. everything else is 1.5.2.",
+ "lock_digest": "103bcf3d355ec1eb8c95cca5d5496f38d04649e34eed0b49b1450b4b639fd5b1",
+ "notes": "somatic core 1.6.0: lanes. many seats' chats on one model at once, on one clock: learning, store reads and updates, generation and search/run batched across lanes (24 lanes of soma-1b on an H100). training ~2x faster (lanes batched, bf16 attention, FlexAttention, TF32). one lane is the 1.5 runtime exactly.",
  "opens": [
   "0.1.0",
   "0.1.1",
@@ -23,14 +23,15 @@
   "1.5.0",
   "1.5.1",
   "1.5.2",
-  "1.5.3"
+  "1.5.3",
+  "1.6.0"
  ],
  "optional_python": {
   "numba": ">=0.60",
   "pytest": ">=8",
   "wasmtime": "==50.0.1"
  },
- "released_on": "2026-11-22",
+ "released_on": "2026-11-24",
  "requires_app": "1.2.0",
  "requires_python": {
   "numpy": ">=2.0",
@@ -39,5 +40,5 @@
  },
  "runtime_id": "soma.somatic_core",
  "statement": 1,
- "version": "1.5.3"
+ "version": "1.6.0"
 }

@@ -60,12 +60,39 @@ def _rope_table(n, d, device):
     return a.cos(), a.sin()
 
 
+_FLEX = {}
+
+
+def _flex_attn(q, k, v, Lc, win):
+    """the sliding band of forward_cache (query i at Lc + i reads keys j with i + Lc - win < j <= i + Lc) through
+    FlexAttention (Nov 24, throughput): the same mask, a fused kernel that skips the blocks outside the band instead of
+    an explicit (C, T) mask in the memory-efficient kernel. Compiled once per shape."""
+    from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+    C, T = q.shape[2], k.shape[2]
+    key = (C, T, Lc, win, q.device)
+    if key not in _FLEX:
+        def band(b, h, qi, kj):
+            qa = qi + Lc
+            return (kj <= qa) & (kj > qa - win) if win else kj <= qa
+        _FLEX[key] = create_block_mask(band, None, None, C, T, device=q.device)
+        if "fn" not in _FLEX:
+            # dynamic=None: a shape that changes (lanes come and go, a window grows) is compiled once as dynamic, not
+            # once per value until torch's recompile limit drops it to the slow eager kernel (Nov 24, lanes on soma-1b)
+            _FLEX["fn"] = torch.compile(flex_attention, dynamic=None)
+            torch._dynamo.config.cache_size_limit = max(int(torch._dynamo.config.cache_size_limit), 64)
+    return _FLEX["fn"](q, k, v, block_mask=_FLEX[key])
+
+
 class AttnBlock(torch.nn.Module):
     """a pre-LayerNorm causal self-attention block with a GELU MLP (GPT-2 form)."""
     def __init__(self, H, heads, L):
         super().__init__()
         self.heads = heads
         self.flash = False                                                   # set by the core (att_kernel)
+        self.flex = False                                                    # cuda: the band through FlexAttention
+        # att_bf16 (Nov 24, throughput): rotary is computed in fp32 (its tables are fp32), which made attention itself
+        # run in fp32 under autocast; with this set, q/k/v go back to the projections' dtype after rotation
+        self.half = False
         self.l1 = torch.nn.LayerNorm(H); self.qkv = torch.nn.Linear(H, 3 * H); self.o = torch.nn.Linear(H, H)
         self.l2 = torch.nn.LayerNorm(H); self.f1 = torch.nn.Linear(H, 4 * H); self.f2 = torch.nn.Linear(4 * H, H)
         for m, sd in ((self.qkv, 0.02), (self.f1, 0.02), (self.o, 0.02 / (2 * L) ** 0.5), (self.f2, 0.02 / (2 * L) ** 0.5)):
@@ -76,6 +103,8 @@ class AttnBlock(torch.nn.Module):
         q, k, v = self.qkv(self.l1(x)).view(B, T, 3, self.heads, H // self.heads).permute(2, 0, 3, 1, 4)
         if cos is not None:
             q, k = _rot(q, cos[:T], sin[:T]), _rot(k, cos[:T], sin[:T])
+            if self.half:
+                q, k = q.to(v.dtype), k.to(v.dtype)
         if self.flash and flash_mps.supported(q):                          # 1.2.1: no T x T is ever stored
             a = flash_mps.FlashAttn.apply(q, k, v).transpose(1, 2).reshape(B, T, H)
         else:
@@ -94,8 +123,12 @@ class AttnBlock(torch.nn.Module):
         ka = k if ck is None else torch.cat([ck.to(k.dtype), k], 2)                 # a prefilled cache may be fp32 under bf16
         va = v if cv is None else torch.cat([cv.to(v.dtype), v], 2)
         qr, kr = _rot(q, cos[Lc:T], sin[Lc:T]), _rot(ka, cos[:T], sin[:T])        # relative: only distances matter
+        if self.half:
+            qr, kr = qr.to(v.dtype), kr.to(v.dtype)
         if Lc == 0 and not (win and C > win):
             a = torch.nn.functional.scaled_dot_product_attention(qr, kr, va, is_causal=True)
+        elif self.flex and x.is_cuda:
+            a = _flex_attn(qr, kr, va.to(qr.dtype), Lc, win)
         else:                                                                 # query i sees the past and new j <= i
             qi = (Lc + torch.arange(C, device=x.device))[:, None]
             kj = torch.arange(T, device=x.device)[None, :]
@@ -111,6 +144,8 @@ class AttnBlock(torch.nn.Module):
         q, k, v = self.qkv(self.l1(x)).view(B, T, 3, self.heads, H // self.heads).permute(2, 0, 3, 1, 4)
         if cos is not None:                                                   # rotary: cached keys keep their angles
             q, k = _rot(q, cos[n:n + T], sin[n:n + T]), _rot(k, cos[n:n + T], sin[n:n + T])
+            if self.half:                                                     # att_bf16: the cache in bf16 too (Nov 24)
+                q, k = q.to(v.dtype), k.to(v.dtype)
         if kv[0] is None:
             kv[0], kv[1] = k, v
             a = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
@@ -231,6 +266,34 @@ class Learner3(torch.nn.Module):
             self.h = h
         return self.out(h)
 
+    def forward_lanes(self, seq, feat, cache):
+        """B lanes' ticks in one pass (Nov 24, throughput; lanes.py): seq (B, C) inputs, feat (B, C, ...) store features,
+        cache = [(K, V)] per block with K (B, heads, Lk, d), or None. The same maths as _forward_cached for each lane
+        (one lane: identical); the weights don't change within a round, so the lanes' graphs are one graph.
+        -> logits (B, C, V) and this tick's [(K, V)] per block."""
+        B, C = seq.shape
+        need = C + (cache[0][0].shape[2] if cache else 0)
+        if need > self.rcos.shape[0]:
+            self.rcos, self.rsin = _rope_table(2 * need, self.rcos.shape[1] * 2, self.rcos.device)
+        assert self.rope and not self.past_on
+        inj = self.cell(self.ln(feat.reshape(B, C, -1)))
+        if self.fmlp is not None:
+            inj = inj + self.fmlp(inj)
+        x = self.emb(seq) + inj
+        ck = self.ckpt and torch.is_grad_enabled()
+        out = []
+        for i, b in enumerate(self.blocks):
+            if i and self.inject.startswith("every"):
+                x = x + inj
+            kv = cache[i] if cache else (None, None)
+            if ck:
+                x, k, v = torch.utils.checkpoint.checkpoint(b.forward_cache, x, kv[0], kv[1], self.rcos, self.rsin,
+                                                            self.slide, use_reentrant=False)
+            else:
+                x, k, v = b.forward_cache(x, kv[0], kv[1], self.rcos, self.rsin, self.slide)
+            out.append((k.detach(), v.detach()))
+        return self.out(self.ln_f(x)), out
+
     @torch.no_grad()
     def prefill(self, seq):
         """the cached past rebuilt from tokens alone (a resumed or broken stream): one causal pass with today's weights
@@ -303,6 +366,9 @@ class Core2(_Core):
     def __init__(self, cfg: dict, dev, blen: np.ndarray):
         super().__init__(cfg, dev, blen, parity=False)
         c = self.c
+        if self.dev.type == "cuda":                       # Nov 24: the trainer never set this (only the app did), so the
+            torch.backends.cuda.matmul.allow_tf32 = bool(int(c.get("tf32", 1)))   # 1B run's fp32 matmuls ran without TF32
+            torch.backends.cudnn.allow_tf32 = bool(int(c.get("tf32", 1)))
         if str(c.get("learner", "mlp")) == "attn":                         # dev: hidden is its width, depth its layers
             self.net = Learner3(self.V, int(c["proj"]), self.O, self.NB, int(c["hidden"]), int(c.get("depth", 1)),
                                 int(c.get("att_heads", 6)), int(c.get("att_ctx", 1024)),
@@ -316,6 +382,11 @@ class Core2(_Core):
             fk = int(c.get("att_kernel", 0))                               # -1 auto: the Metal flash kernel on mps
             for b in self.net.blocks:
                 b.flash = (bool(fk) if fk >= 0 else self.dev.type == "mps") and self.dev.type == "mps"
+                b.flex = bool(int(c.get("att_flex", 0))) and self.dev.type == "cuda"
+                b.half = bool(int(c.get("att_bf16", 0)))
+            if int(c.get("att_compile", 0)) and self.dev.type == "cuda":
+                for b in self.net.blocks:
+                    b.forward_cache = torch.compile(b.forward_cache, dynamic=False)
         else:
             self.net = Learner2(self.V, int(c["window"]), int(c["emb"]), int(c["hidden"]), int(c["proj"]), self.O,
                                 self.NB, depth=int(c.get("depth", 1)), final_norm=int(c.get("final_norm", 0))).to(self.dev)
@@ -370,7 +441,7 @@ class Core2(_Core):
         return out
 
     # ---- GPU: the factorised read ----
-    def _read2(self, idt, gid, maps, ys, mp, mb, win, t0, grad, rows=None):
+    def _read2(self, idt, gid, maps, ys, mp, mb, win, t0, grad, rows=None, defer=False):
         """-> zE inputs: lpE, lpL (C, V), gate key, deep; plus nothing else (no lch)."""
         C, V, NB, d = win.shape[0], self.V, self.NB, self.dev
         keep = 1.0 - self.ab                                             # (NB,)
@@ -479,6 +550,11 @@ class Core2(_Core):
             with torch.set_grad_enabled(grad):
                 feat = features(None)
                 self._t('read:features')
+                if defer:                                  # lanes_batch: the learner runs later, every lane in one pass
+                    with torch.no_grad():
+                        ent = -(lpE.exp() * lpE).sum(-1) / math.log(2)
+                        key = (deep * LB + mbt) * NE + torch.bucketize(ent, self.edges)
+                    return lpE, None, key, deep, feat
                 lpL = torch.log_softmax(self._learner(wt, feat), -1)
                 self._t('learner fwd')
         else:
@@ -550,6 +626,9 @@ class Core2(_Core):
             return torch.einsum("ibt,itd->ibd", v, Pm.index_select(0, t.reshape(-1)).reshape(n, T, DP))
         A = torch.zeros(n, NB, V, device=v.device, dtype=v.dtype)
         A.scatter_add_(2, t[:, None, :].expand(n, NB, T), v)
+        if v.is_cuda and int(self.c.get("feat_bf16", 0)):     # Nov 24: bf16 operands, fp32 accumulation
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                return (A @ Pm).float()
         return A @ Pm
 
     def _feat(self, pk, ix):
@@ -588,6 +667,14 @@ class Core2(_Core):
                 z = self.net(wt, feat)
             return z.float()
         return self.net(wt, feat)
+
+    def _learner_lanes(self, seq, feat, cache):
+        """forward_lanes under the same autocast as _learner -> (logits fp32 (B, C, V), this tick's [(K, V)])"""
+        if self.dev.type == "cuda" and int(self.c.get("learner_bf16", 0)):
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                z, out = self.net.forward_lanes(seq, feat, cache)
+            return z.float(), out
+        return self.net.forward_lanes(seq, feat, cache)
 
     def _maps2(self, ids):
         out = {}

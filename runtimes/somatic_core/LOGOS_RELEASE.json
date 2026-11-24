@@ -1,20 +1,20 @@
 {
  "runtime_id": "soma.somatic_core",
- "version": "1.5.3",
- "released": "2026-11-22",
+ "version": "1.6.0",
+ "released": "2026-11-24",
  "files": [
   {
-   "name": "soma-somatic-core-1.5.3.tar.gz",
-   "sha256": "b7564b05d48b33bf1047d71311872e627be4e326739bc9266ebac06fa5c220d3"
+   "name": "soma-somatic-core-1.6.0.tar.gz",
+   "sha256": "eff9b03231333cacc8e879cc544851487c4c756f61a02c8f7c1cfd130f0c349c"
   },
   {
    "name": "release.json",
-   "sha256": "6ed0ac6f1da544411ea6328206cc51c3a912d6a4fba754062f2aaa11d3f274a9"
+   "sha256": "d5768632cd2fa15d4cd96ad3f01b157a7d5cbd343a59e96446fc4e58bf0baaf5"
   },
   {
    "name": "release.sig",
-   "sha256": "21ca41fb3747d77649530ea6bcda402d9b015ee930f7ee111cb50cf61762c3ac"
+   "sha256": "9fb6d49f3efd0344c69db6b86c6d3b2580d5dea4d7f47fb93670df29e7b963f8"
   }
  ],
- "source": "https://logossoma.com/api/runtimes/soma.somatic_core/releases/1.5.3"
+ "source": "https://logossoma.com/api/runtimes/soma.somatic_core/releases/1.6.0"
 }

@@ -46,7 +46,7 @@ except ImportError:                                                     # as scr
 
 SPECIES = "somatic_core"
 RUNTIME_ID = "soma.somatic_core"
-RUNTIME_VERSION = "1.5.3"
+RUNTIME_VERSION = "1.6.0"
 SESSION_FILE = "soma_state"                                               # the control that opens a file in a session
 TRACES_SUFFIX = ".traces.jsonl"                                           # 1.5.3: a file of recorded turns, read as turns
 TRACE_SEGMENT_CHARS = 400_000
@@ -269,6 +269,15 @@ class CoreConfig:
     learn_mode: str = "skip"       # skip | accumulate (by tick) | select (every learn_stride-th prediction) | io2 (io2 picks it)
     tf32: int = 1                  # cuda only: fp32 matmuls on tensor cores (TF32); no effect on mps or cpu
     learner_bf16: int = 0          # cuda only: the learner's forward and backward in bf16 autocast (weights and Adam fp32)
+    # throughput (Nov 24; James: "we need to bring compute costs down first"). cuda only; off: the 1.5 learner exactly
+    att_bf16: int = 0              # attention in the projections' dtype after rotary (rotary's fp32 tables made it fp32)
+    att_flex: int = 0              # the sliding band through FlexAttention (same mask, a fused kernel)
+    att_compile: int = 0           # the learner's blocks under torch.compile
+    lanes_batch: int = 0           # lanes: every lane's learner pass in one (B, C) pass and one backward (same maths)
+    feat_bf16: int = 0             # the learner's store features (counts x projection) as bf16 matmuls
+    lanes_read: int = 0            # lanes_batch: every lane's store read in one pass too (lanes_read.py; same maths)
+    lanes_store: int = 0           # lanes_batch: every lane's store update in one pass (lanes_store.py; same maths)
+    lanes_read_group: int = 0      # lanes_read: lanes read this many at a time (0: all at once); bounds its working memory
     rehearse: int = 0              # dev (Nov 10): extra learner steps per tick on reads taken before their store update
     rehearse_span: int = 1         # dev: 1 = repeat the current tick; D > 1 = each extra step on one of the last D ticks
     # how the learner is bounded (1.1): wd = AdamW decoupled weight decay on matrices, vectors clamped to +-8 (default);
@@ -383,6 +392,8 @@ class SOMA:
             fk = int(self.config.att_kernel)
             for b in self.core.net.blocks:
                 b.flash = (bool(fk) if fk >= 0 else self.device.type == "mps") and self.device.type == "mps"
+                b.flex = bool(int(self.config.att_flex)) and self.device.type == "cuda"      # Nov 24: throughput flags
+                b.half = bool(int(self.config.att_bf16))
         if self.core.io2 is not None:
             self.core.io2.lr_base = float(config.lr_base)
         for g in self.core.mopt.param_groups:

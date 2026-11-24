@@ -868,6 +868,115 @@ class Core3(Core2):
             self.pools[k].load(s["pools"][str(k)])
         self._kv, self._kv_end = None, -1                  # the window is rebuilt from the matcher's ring
 
+    # ---- lanes in one learner pass (Nov 24, throughput; lanes_batch). step() in three parts for a lane (_ext,
+    # learn_mode accumulate, mix_shared 1, fixed rate, no io2, att_cache): lane_pre reads the store and builds the
+    # learner's inputs; Lanes runs every lane's learner as one (B, C) pass; lane_post_a scores and moves the gate (in
+    # lane order, as step does); one backward for all lanes; lane_post_b the mixer's gradient and the store's update.
+    # The store updates wait for the backward: the features' graph reads the lane's store (r0). Same arithmetic as step
+    # for every lane; only the learner's backward sums in another order (tests/lanes_batch.py).
+    def lane_pre(self, m: Matcher, ys, read: bool = True) -> dict:
+        ys = np.asarray(ys, np.int64)
+        C = len(ys)
+        t0 = self.clock
+        ids, rec, mp, mb, win = self._contexts(m, ys, True)
+        net = self.net
+        assert isinstance(net, Learner3) and net.cache_on and not net.past_on, "lanes_batch: the cached attention learner"
+        ts = m.t - C
+        L = max(1, min(ts, net.ctx - C + 1))
+        prev = m.R[np.arange(ts - L, ts) % m.ring] if ts > 0 else np.zeros(1, np.int64)
+        seq = self._dv(np.concatenate([prev[-1:], ys[:-1]]).astype(np.int64))
+        ok = getattr(self, "_kv", None) is not None and self._kv_end == ts
+        if not ok:
+            Lc = max(0, min(ts - 1, net.ctx - (1 if net.slide else C)))
+            self._kv = net.prefill(self._dv(m.R[np.arange(ts - 1 - Lc, ts - 1) % m.ring].astype(np.int64))) if Lc > 0 else None
+            self.kv_rebuilds = getattr(self, "kv_rebuilds", 0) + 1
+        cache = self._kv
+        idt = self._idt(ids)
+        gid = self._gids(ids, rec, C)
+        with torch.no_grad():
+            for k in self.orders:
+                if rec[k]:
+                    nodes = np.array([n for _, n in rec[k]], np.int64)
+                    nd = self._dv(nodes)
+                    self.st[k].index_fill_(0, nd, 0.0)
+                    self.sl[k].index_fill_(0, nd, t0)
+                    pp, _ = self._node_pairs(k, nodes)
+                    if len(pp):
+                        self.pc[k].index_fill_(0, self._dv(pp), 0.0)
+        maps = self._maps2(ids)
+        y = self._dv(ys)
+        P = dict(m=m, ys=ys, C=C, t0=t0, ids=ids, rec=rec, idt=idt, y=y, seq=seq, cache=cache,
+                 s_=max(1, int(self.c.get("learn_stride", 1))))
+        if not read:                                       # lanes_read: every lane's read in one pass (lanes_read.py)
+            P.update(gid=gid, maps=maps, mp=mp, mb=mb, win=win)
+            return P
+        lpE, _, key, deep, feat = self._read2(idt, gid, maps, ys, mp, mb, win, t0, grad=True, rows=None, defer=True)
+        P.update(lpE=lpE, key=key, deep=deep, feat=feat)
+        return P
+
+    def lane_post_a(self, P: dict, lpL, cache_out, cache_done: bool = False):
+        """scoring, the gate's step and the cached window -> this lane's learner loss (already / learn_stride)"""
+        y, C, m, lpE, key = P["y"], P["C"], P["m"], P["lpE"], P["key"]
+        lyE = lpE.gather(1, y[:, None])[:, 0]
+        lyL = lpL.gather(1, y[:, None])[:, 0]
+        with torch.no_grad():
+            sg = torch.sigmoid(self.theta[key])
+            a_, b_ = lyE.detach().exp(), lyL.detach().exp()
+            pf = sg * a_ + (1 - sg) * b_
+            pfull = sg[:, None] * lpE.detach().exp() + (1 - sg)[:, None] * lpL.detach().exp()
+            self.acc[:3] += torch.stack([-lyE.detach().sum(), -lyL.detach().sum(), -torch.log(pf).sum()]) / math.log(2)
+            self.acc[4] += (pfull.argmax(-1) == y).float().sum()
+            self.acc[5] += C
+            self.theta.index_put_((key,), float(self.c["gate_lr"]) * sg * (1 - sg) * (a_ - b_) / pf, accumulate=True)
+        self.last = dict(tokens=P["ys"], bits=-torch.log2(pf), exact=-lyE.detach() / math.log(2), next=pfull[-1].topk(5),
+                         learner=-lyL.detach() / math.log(2), deep=P["deep"])
+        if not cache_done:                                 # (Lanes keeps the batched window itself when it can)
+            keep = self.net.ctx - (1 if self.net.slide else C)
+            ci, co = P["cache"], cache_out
+            kv = co if not ci else [(torch.cat([a[0], b[0]], 2), torch.cat([a[1], b[1]], 2)) for a, b in zip(ci, co)]
+            self._kv = [(k[:, :, max(0, k.shape[2] - keep):].contiguous(), v[:, :, max(0, v.shape[2] - keep):].contiguous())
+                        for k, v in kv] if keep > 0 else None
+            self._kv_end = m.t
+        P["lossE"], P["pf"] = -lyE.mean(), pf
+        P["feat"] = P["lpE"] = None
+        return -lyL.mean() / P["s_"]
+
+    def lane_post_b(self, P: dict, mixer: bool = True, store: bool = True):
+        """after the shared backward: the mixer's gradient, the store's update, the clocks"""
+        ids, rec, ys, idt, y, t0, C, s_ = (P[k] for k in ("ids", "rec", "ys", "idt", "y", "t0", "C", "s_"))
+        gE = torch.autograd.grad(P["lossE"], [self.wE, self.wM]) if mixer else None   # (lanes_read: once a round)
+        slot, pair, new = self._assign(ids, rec, ys)
+        if self.chunks % 1024 == 0:
+            if not isinstance(self.opt, bounds.SphereSGD):
+                bounds.cap_steps_(self.opt)
+            bounds.cap_steps_(self.mopt)
+        with torch.no_grad():
+            if gE is not None:
+                gE = [torch.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0) for g in gE]
+                for w, g in zip((self.wE, self.wM), gE):
+                    w.grad = g / s_ if w.grad is None else w.grad + g / s_
+            if self.bounded:
+                for v in (self.wE, self.wM, self.theta):
+                    v.clamp_(-bounds.SCALAR_BOUND, bounds.SCALAR_BOUND)
+            if store:
+                self._store_update(ids, idt, pair, new, y, t0, C)
+            else:                                          # lanes_store: every lane's update at once, then lane_clock
+                P["pair"], P["new"] = pair, new
+                return -torch.log2(P["pf"])
+        self.lane_clock(P)
+        return -torch.log2(P["pf"])
+
+    def lane_clock(self, P: dict):
+        """after the store's update: the store's clocks (its own: it ages with its own tokens)"""
+        C = P["C"]
+        self.clock += C
+        self.chunks += 1
+        self.n0_all += C
+        if self.n0_all > float(self.c["alltime_cap"]):
+            self._halve()
+        if self.clock >= self.rebase_at:
+            self._rebase()
+
     REWARM = 256                                          # ticks over which a slim checkpoint's rate re-warms
 
     def apply_update(self, k: int, lanes: int):
