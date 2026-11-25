@@ -1,0 +1,306 @@
+[
+  [
+    null,
+    "finding things"
+  ],
+  [
+    "/models",
+    "public models (also: /public models)"
+  ],
+  [
+    "/search <words>",
+    "commands and models that match"
+  ],
+  [
+    "/open <model|n>",
+    "a model's page. n: a number from the last list"
+  ],
+  [
+    "/star, /unstar, /download, /fork",
+    "the model on screen"
+  ],
+  [
+    "/whois @name, /profile",
+    "a person. you"
+  ],
+  [
+    "/developments, /developments <n>",
+    "the lab notebook"
+  ],
+  [
+    "/runtime, /runtime <id>",
+    "somatic core, and its specification"
+  ],
+  [
+    "/get soma",
+    "the app: mac, windows"
+  ],
+  [
+    "/about, /info",
+    "the system. machine-readable sources"
+  ],
+  [
+    null,
+    "your models"
+  ],
+  [
+    "/my models",
+    "your library, and where each model lives"
+  ],
+  [
+    "/where <model>",
+    "where it is stored, where it is loaded"
+  ],
+  [
+    "/new model",
+    "a new model: a shape (tiny to 5b), where it runs, where it is saved"
+  ],
+  [
+    "/upload",
+    "a model file from this browser, as a private model"
+  ],
+  [
+    "/add <model>",
+    "a public model, into your library"
+  ],
+  [
+    "/rename <model> to <name>",
+    "a new name. history and places stay"
+  ],
+  [
+    "/publish <model>",
+    "a frozen, dated snapshot, public"
+  ],
+  [
+    "/move <model>",
+    "to logOS, a machine, or a volume in a data center. it asks where"
+  ],
+  [
+    "/load <model>",
+    "load it where it is stored, or elsewhere. it asks"
+  ],
+  [
+    "/unload <model>",
+    "save it. free the machine"
+  ],
+  [
+    "/warm <model> [9-17 | off]",
+    "hours its machine is already up. it starts itself first, and stays up through them"
+  ],
+  [
+    "/delete model <model>",
+    "every copy, everywhere, for good. unload it first"
+  ],
+  [
+    "/history <model>",
+    "its record: saves, reads, scores, machines, shares"
+  ],
+  [
+    "/files <model>",
+    "its files, unloaded: /delete file <name>, /rename file <a> to <b>"
+  ],
+  [
+    "/chats",
+    "your chat with each model. one per model, every device"
+  ],
+  [
+    "/download chat <n>, /download chats",
+    "your chats: histories, then stores"
+  ],
+  [
+    "/curve <model> [on <file>]",
+    "its scores over time"
+  ],
+  [
+    null,
+    "sharing"
+  ],
+  [
+    "/share <model> with @name",
+    "they may start it and talk to it. learning on: what they say teaches it, for everyone"
+  ],
+  [
+    "/share <model> with @name learning off",
+    "for them, reading only. learning on turns it back. separate chats do not isolate that learning"
+  ],
+  [
+    "/unshare <model> from @name",
+    "access ends"
+  ],
+  [
+    "/shared models",
+    "shared with you, and shared by you"
+  ],
+  [
+    "/budget <model> [$20/month | $1.50/h | off]",
+    "what its machines may spend a month; what a guest's machine may cost an hour"
+  ],
+  [
+    "/usage <model>",
+    "this month's spending and teaching, by person"
+  ],
+  [
+    null,
+    "talking to a model"
+  ],
+  [
+    "/talk to <model>",
+    "load it where it lives, and talk (also: /chat to, /chat with)"
+  ],
+  [
+    "/exit",
+    "leave. the model stays loaded. /unload stops it"
+  ],
+  [
+    "/pick",
+    "send files to read"
+  ],
+  [
+    "/paste <file>",
+    "one of its files, read into this chat's working memory. a long paste in a message goes the same way"
+  ],
+  [
+    "/files, /read <file>",
+    "its files. /read: into the weights, in its own store. /paste: into this chat"
+  ],
+  [
+    "/learn on, /learn off",
+    "weight updates. on by default"
+  ],
+  [
+    "/score <file>",
+    "read with learning off. the result goes on its curve"
+  ],
+  [
+    "/force read on, /force read off",
+    "on (default): reads straight through, then waits for a turn. off: takes its turn where it predicts one"
+  ],
+  [
+    "/search on|off, /run on|off",
+    "its two skills: look things up and follow links; run python in a sandbox"
+  ],
+  [
+    "/images on|off, /videos on|off",
+    "pictures and videos from pages it reads. images show, videos are a click (defaults)"
+  ],
+  [
+    "/backup",
+    "a copy on logOS, as it is now"
+  ],
+  [
+    "/save",
+    "save it where it lives"
+  ],
+  [
+    "/stop, /stop <n>",
+    "stop the answer; with a number, stop read n where it is"
+  ],
+  [
+    "/resume <n>, /skip <n>",
+    "carry read n on. end read n there"
+  ],
+  [
+    "/lanes",
+    "your reads, their progress and controls, your chat"
+  ],
+  [
+    "/auto read on|off|<n>",
+    "lanes that read its whole folder on a loop, giving way to seats (on: 4). outside a conversation: /auto read <model> on|off|<n>"
+  ],
+  [
+    "/download chat",
+    "this chat: history, then store"
+  ],
+  [
+    "/who",
+    "a shared model: who is here, who it is answering"
+  ],
+  [
+    null,
+    "machines and the cloud"
+  ],
+  [
+    "/machines",
+    "the machines that run your models"
+  ],
+  [
+    "/link <code>, /unlink <name>",
+    "add or remove a machine"
+  ],
+  [
+    "/cloud",
+    "what bills now on your runpod account"
+  ],
+  [
+    "/cloud history",
+    "every cloud machine run, and its approximate cost"
+  ],
+  [
+    "/runpod setup",
+    "from no account to a linked key, step by step"
+  ],
+  [
+    "/runpod key, /runpod forget",
+    "link or forget your runpod key"
+  ],
+  [
+    "/cloud offers [<model>]",
+    "gpus free now, and their prices"
+  ],
+  [
+    "/cloud start <model>",
+    "rent a gpu and load it"
+  ],
+  [
+    "/cloud status <machine>",
+    "one machine"
+  ],
+  [
+    "/cloud adopt <volume> <path> as <name>",
+    "a model file already on a volume"
+  ],
+  [
+    null,
+    "you, and the terminal"
+  ],
+  [
+    "/sign in, /sign out, /whoami",
+    "you"
+  ],
+  [
+    "/set username <name>",
+    "your name. never from your email. old names still find you"
+  ],
+  [
+    "/tokens, /token new <name>, /token revoke <name>",
+    "keys for programs: read, talk, manage, spend (capped monthly)"
+  ],
+  [
+    "/settings, /set home <command>, /set start <command>",
+    "what /home runs. what logOS opens with"
+  ],
+  [
+    "/privacy",
+    "what logOS holds, in what form, for how long"
+  ],
+  [
+    "/notices",
+    "credit, holds, failed machines"
+  ],
+  [
+    "/history",
+    "your terminal from every device, up to now. /history clear deletes it"
+  ],
+  [
+    "/close account",
+    "everything logOS holds of yours, deleted. download chats first"
+  ],
+  [
+    "/home, /help",
+    "the title. this page"
+  ],
+  [
+    "/back, /clear",
+    "the last page. a clean screen"
+  ]
+]

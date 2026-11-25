@@ -1,0 +1,82 @@
+/* the terminal on the glass: one panel, strict ascii, bold is a link */
+.tm { position: absolute; inset: 0; display: flex; flex-direction: column; padding: 4px 28px 14px;
+  font: 14px/1.5 "IBM Plex Mono", ui-monospace, Menlo, monospace; color: #cdeedb; }
+/* text fades off the top and bottom of the scrollback; padding keeps the first and newest lines clear of the fade */
+.tm-scroll { flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain;
+  scrollbar-width: thin; scrollbar-color: #2f4438 transparent; padding: 28px 0 18px;
+  -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 34px, #000 calc(100% - 22px), transparent 100%);
+  mask-image: linear-gradient(to bottom, transparent 0, #000 34px, #000 calc(100% - 22px), transparent 100%); }
+.tm-scroll::-webkit-scrollbar { width: 6px; }
+.tm-scroll::-webkit-scrollbar-thumb { background: #2f4438; }
+/* every line wraps at the glass's edge, spacing kept, even where the text kit's own wrapping didn't reach */
+.tm-ln { white-space: pre-wrap; overflow-wrap: anywhere; min-height: 1.5em; font-family: inherit !important; }
+.tm-blk + .tm-blk { margin-top: 1.5em; }
+.tm-lk { font-weight: 600; color: #f2fff7; text-decoration: none; cursor: pointer; }
+.tm-lk:hover, .tm-lk:focus-visible { background: #cdeedb; color: #040706; text-shadow: none; outline: none; }
+.tm-dm { color: #7f9d8c; }
+.tm-hi { color: #f2fff7; }
+.tm-am { color: #e8c48a; }
+.tm-echo { color: #f2fff7; }
+.tm-srow { flex: none; display: flex; padding-top: 8px; min-height: 1.5em; color: #7f9d8c; }
+.tm-sugg { flex: 1; min-width: 0; white-space: pre; overflow-x: auto; overflow-y: hidden; scrollbar-width: none; }
+.tm-more { flex: none; white-space: pre; color: #f2fff7; }
+.tm-more:first-child { padding-right: 1ch; }
+.tm-more:last-child { padding-left: 1ch; }
+.tm-more[hidden] { display: none; }
+.tm-sugg::-webkit-scrollbar { display: none; }
+/* the prompt wraps like any line, grows with what you type up to half the screen, then scrolls */
+.tm-pline { flex: none; position: relative; display: block; white-space: pre-wrap; overflow-wrap: anywhere; padding-top: 2px; cursor: text;
+  min-height: 1.5em; max-height: 50%; overflow-y: auto; overflow-x: hidden; scrollbar-width: thin; scrollbar-color: #2f4438 transparent; }
+.tm-pline::-webkit-scrollbar { width: 6px; }
+.tm-pline::-webkit-scrollbar-thumb { background: #2f4438; }
+.tm-ps { color: #7f9d8c; }
+.tm-typed { color: #f2fff7; white-space: pre-wrap; }
+.tm-bk { background: #f2fff7; color: #040706; text-shadow: none; animation: tm-blink 1.05s steps(1) infinite; }
+@keyframes tm-blink { 50% { background: transparent; color: #f2fff7; } }
+.tm-printing .tm-bk, .tm-busy .tm-bk { animation: none; }
+.tm-busy .tm-bk { background: #7f9d8c; }
+/* the real field under the prompt: drawn in transparent ink rather than at opacity 0, because iOS treats a fully
+   transparent field as hidden and then offers no caret menu (no paste). nothing of it shows: no ink, caret, glow or
+   selection. */
+.tm-input { position: absolute; inset: 0; width: 100%; height: 100%; resize: none; overflow: hidden; opacity: 1; font: inherit; font-size: 16px; border: 0 !important; padding: 0;
+  background: transparent !important; color: transparent; -webkit-text-fill-color: transparent; caret-color: transparent; text-shadow: none !important;
+  outline: none !important; box-shadow: none !important; -webkit-user-select: text; user-select: text; -webkit-touch-callout: default; }
+.tm-input::selection { background: transparent; color: transparent; }
+/* touch screens: paste, at the end of the suggestions, for when the system menu doesn't come */
+.tm-paste { margin-right: 3ch; }
+.tm-measure { position: absolute; visibility: hidden; white-space: pre; font: 14px/1.5 "IBM Plex Mono", ui-monospace, Menlo, monospace; }
+@media (max-width: 600px) {
+  .tm { padding: 2px 12px 10px; font-size: 13px; }
+  .tm-measure { font-size: 13px; }
+}
+@media (prefers-reduced-motion: reduce) { .tm-bk { animation: none; } }
+
+/* the pages the terminal hands off to (upload, admin): a way back */
+
+/* the terminal keeps to a centred column; the spare width either side of it rolls the runtime's source (rain.js) */
+.tm-scroll, .tm-srow, .tm-strow, .tm-rows, .tm-pline { width: 100%; max-width: calc(100ch + 16px); margin-left: auto; margin-right: auto; }
+.tm-rain { position: absolute; pointer-events: none; opacity: .72;
+  -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 12%, #000 80%, transparent 100%);
+  mask-image: linear-gradient(to bottom, transparent 0, #000 12%, #000 80%, transparent 100%); }
+.tm-rain[hidden] { display: none; }
+
+/* 1.5.2: images and videos a model read or showed */
+.tm-media { display: inline-block; margin: 6px 0; }
+.tm-img { display: block; max-width: min(100%, 520px); max-height: 380px; border: 1px solid #2a3a32; background: #0b120f; }
+.tm-vid { display: block; width: min(100%, 560px); aspect-ratio: 16 / 9; height: auto; margin: 6px 0; border: 1px solid #2a3a32; background: #000; }
+
+/* Nov 23: the status line: what a model is doing now, and that it's alive */
+.tm-strow { flex: none; display: flex; padding-top: 6px; min-height: 1.5em; color: #7f9d8c; }
+.tm-strow[hidden] { display: none; }
+.tm-rows { flex: none; padding-top: 6px; color: #7f9d8c; }
+.tm-rows[hidden] { display: none; }
+.tm-rline { white-space: pre; overflow-x: auto; overflow-y: hidden; scrollbar-width: none; }
+.tm-rline::-webkit-scrollbar { display: none; }
+.tm-status { flex: 1; min-width: 0; white-space: pre; overflow-x: auto; overflow-y: hidden; scrollbar-width: none; }
+.tm-status::-webkit-scrollbar { display: none; }
+.tm-strow .tm-more:first-child { padding-right: 1ch; }
+.tm-strow .tm-more:last-child { padding-left: 1ch; }
+/* a row with more off to one side fades into its '...' */
+.tm-fade-r { -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 5ch), transparent 100%); mask-image: linear-gradient(to right, #000 calc(100% - 5ch), transparent 100%); }
+.tm-fade-l { -webkit-mask-image: linear-gradient(to left, #000 calc(100% - 5ch), transparent 100%); mask-image: linear-gradient(to left, #000 calc(100% - 5ch), transparent 100%); }
+.tm-fade-l.tm-fade-r { -webkit-mask-image: linear-gradient(to right, transparent 0, #000 5ch, #000 calc(100% - 5ch), transparent 100%); mask-image: linear-gradient(to right, transparent 0, #000 5ch, #000 calc(100% - 5ch), transparent 100%); }
