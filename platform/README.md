@@ -8,7 +8,7 @@ reference: [`LANGUAGE.md`](LANGUAGE.md); every command: `/help`.
 |---|---|
 | [`language/`](language) | the language itself: the code the browser terminal runs (`shell.js` holds the rules for running a line) |
 | [`server/run.js`](server/run.js) | the same code run headless by logOS for `/api/run`, one short process per call |
-| [`cli/`](cli) | `logos`, the terminal in your own: `npm i -g logossoma` |
+| [`cli/`](cli) | `logos`, the terminal in your own: `npm i -g logossoma` (on npm: [logossoma](https://www.npmjs.com/package/logossoma)) |
 
 ## for programs
 

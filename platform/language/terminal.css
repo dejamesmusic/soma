@@ -1,40 +1,42 @@
 /* the terminal on the glass: one panel, strict ascii, bold is a link */
 .tm { position: absolute; inset: 0; display: flex; flex-direction: column; padding: 4px 28px 14px;
-  font: 14px/1.5 "IBM Plex Mono", ui-monospace, Menlo, monospace; color: #cdeedb; }
+  font: 700 14px/1.5 "Signal Mono", Menlo, "DejaVu Sans Mono", ui-monospace, monospace; color: var(--mon-ph); }
 /* text fades off the top and bottom of the scrollback; padding keeps the first and newest lines clear of the fade */
 .tm-scroll { flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain;
-  scrollbar-width: thin; scrollbar-color: #2f4438 transparent; padding: 28px 0 18px;
+  scrollbar-width: thin; scrollbar-color: var(--mon-ph-faint) transparent; padding: 28px 0 18px;
   -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 34px, #000 calc(100% - 22px), transparent 100%);
   mask-image: linear-gradient(to bottom, transparent 0, #000 34px, #000 calc(100% - 22px), transparent 100%); }
 .tm-scroll::-webkit-scrollbar { width: 6px; }
-.tm-scroll::-webkit-scrollbar-thumb { background: #2f4438; }
+.tm-scroll::-webkit-scrollbar-thumb { background: var(--mon-ph-faint); }
 /* every line wraps at the glass's edge, spacing kept, even where the text kit's own wrapping didn't reach */
 .tm-ln { white-space: pre-wrap; overflow-wrap: anywhere; min-height: 1.5em; font-family: inherit !important; }
 .tm-blk + .tm-blk { margin-top: 1.5em; }
-.tm-lk { font-weight: 600; color: #f2fff7; text-decoration: none; cursor: pointer; }
-.tm-lk:hover, .tm-lk:focus-visible { background: #cdeedb; color: #040706; text-shadow: none; outline: none; }
-.tm-dm { color: #7f9d8c; }
-.tm-hi { color: #f2fff7; }
-.tm-am { color: #e8c48a; }
-.tm-echo { color: #f2fff7; }
-.tm-srow { flex: none; display: flex; padding-top: 8px; min-height: 1.5em; color: #7f9d8c; }
+/* everything is bold (Nov 26, James), so a command is the brightest ink, underlined */
+.tm-lk { font-weight: 700; color: var(--mon-ph-hi); text-decoration: underline; text-decoration-thickness: 1px; text-underline-offset: 3px; text-decoration-color: var(--mon-ph-dim); cursor: pointer; }
+.tm-lk:hover, .tm-lk:focus-visible { background: var(--mon-ph); color: var(--mon-glass); text-shadow: none; outline: none; }
+.tm-dm { color: var(--mon-ph-dim); }
+.tm-hi { color: var(--mon-ph-hi); }
+.tm-am { color: var(--mon-am); }
+.tm-echo { color: var(--mon-ph-hi); }
+.tm-srow { flex: none; display: flex; padding-top: 8px; min-height: 1.5em; color: var(--mon-ph-dim); }
 .tm-sugg { flex: 1; min-width: 0; white-space: pre; overflow-x: auto; overflow-y: hidden; scrollbar-width: none; }
-.tm-more { flex: none; white-space: pre; color: #f2fff7; }
+.tm-more { flex: none; white-space: pre; color: var(--mon-ph-hi); }
 .tm-more:first-child { padding-right: 1ch; }
 .tm-more:last-child { padding-left: 1ch; }
 .tm-more[hidden] { display: none; }
 .tm-sugg::-webkit-scrollbar { display: none; }
 /* the prompt wraps like any line, grows with what you type up to half the screen, then scrolls */
 .tm-pline { flex: none; position: relative; display: block; white-space: pre-wrap; overflow-wrap: anywhere; padding-top: 2px; cursor: text;
-  min-height: 1.5em; max-height: 50%; overflow-y: auto; overflow-x: hidden; scrollbar-width: thin; scrollbar-color: #2f4438 transparent; }
+  min-height: 1.5em; max-height: 50%; overflow-y: auto; overflow-x: hidden; scrollbar-width: thin; scrollbar-color: var(--mon-ph-faint) transparent; }
 .tm-pline::-webkit-scrollbar { width: 6px; }
-.tm-pline::-webkit-scrollbar-thumb { background: #2f4438; }
-.tm-ps { color: #7f9d8c; }
-.tm-typed { color: #f2fff7; white-space: pre-wrap; }
-.tm-bk { background: #f2fff7; color: #040706; text-shadow: none; animation: tm-blink 1.05s steps(1) infinite; }
-@keyframes tm-blink { 50% { background: transparent; color: #f2fff7; } }
+.tm-pline::-webkit-scrollbar-thumb { background: var(--mon-ph-faint); }
+.tm-ps { color: var(--mon-ph-hi); }
+.tm-typed { color: var(--mon-ph-hi); white-space: pre-wrap; }
+/* the cursor is an underscore, as on the app icon: Φ_ (Nov 26) */
+.tm-bk { box-shadow: inset 0 -.17em 0 var(--mon-ph-hi); animation: tm-blink 1.05s steps(1) infinite; }
+@keyframes tm-blink { 50% { box-shadow: none; } }
 .tm-printing .tm-bk, .tm-busy .tm-bk { animation: none; }
-.tm-busy .tm-bk { background: #7f9d8c; }
+.tm-busy .tm-bk { box-shadow: inset 0 -.17em 0 var(--mon-ph-dim); }
 /* the real field under the prompt: drawn in transparent ink rather than at opacity 0, because iOS treats a fully
    transparent field as hidden and then offers no caret menu (no paste). nothing of it shows: no ink, caret, glow or
    selection. */
@@ -44,7 +46,7 @@
 .tm-input::selection { background: transparent; color: transparent; }
 /* touch screens: paste, at the end of the suggestions, for when the system menu doesn't come */
 .tm-paste { margin-right: 3ch; }
-.tm-measure { position: absolute; visibility: hidden; white-space: pre; font: 14px/1.5 "IBM Plex Mono", ui-monospace, Menlo, monospace; }
+.tm-measure { position: absolute; visibility: hidden; white-space: pre; font: 700 14px/1.5 "Signal Mono", Menlo, "DejaVu Sans Mono", ui-monospace, monospace; }
 @media (max-width: 600px) {
   .tm { padding: 2px 12px 10px; font-size: 13px; }
   .tm-measure { font-size: 13px; }
@@ -66,9 +68,9 @@
 .tm-vid { display: block; width: min(100%, 560px); aspect-ratio: 16 / 9; height: auto; margin: 6px 0; border: 1px solid #2a3a32; background: #000; }
 
 /* Nov 23: the status line: what a model is doing now, and that it's alive */
-.tm-strow { flex: none; display: flex; padding-top: 6px; min-height: 1.5em; color: #7f9d8c; }
+.tm-strow { flex: none; display: flex; padding-top: 6px; min-height: 1.5em; color: var(--mon-ph-dim); }
 .tm-strow[hidden] { display: none; }
-.tm-rows { flex: none; padding-top: 6px; color: #7f9d8c; }
+.tm-rows { flex: none; padding-top: 6px; color: var(--mon-ph-dim); }
 .tm-rows[hidden] { display: none; }
 .tm-rline { white-space: pre; overflow-x: auto; overflow-y: hidden; scrollbar-width: none; }
 .tm-rline::-webkit-scrollbar { display: none; }

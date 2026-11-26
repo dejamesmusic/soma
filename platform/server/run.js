@@ -23,6 +23,23 @@ globalThis.document = {
   visibilityState: 'visible', title: '', addEventListener() {}, removeEventListener() {},
   createElement: () => ({ click() {}, remove() {}, style: {} }), body: { appendChild() {} },
 };
+// uploads (a pasted document going to a model's files) use XMLHttpRequest in the browser; here it is fetch underneath
+// (Nov 26: /api/run's paste and the MCP paste tool failed with "XMLHttpRequest is not defined")
+globalThis.XMLHttpRequest = class {
+  constructor() { this.upload = {}; this.status = 0; this.responseText = ''; this.readyState = 0; }
+  open(method, url) { this.method = method; this.url = url; this.headers = {}; this.readyState = 1; }
+  setRequestHeader(k, v) { this.headers[k] = v; }
+  abort() { this.aborted = true; }
+  send(body) {
+    fetch(this.url, { method: this.method, body, headers: this.headers }).then(async (r) => {
+      if (this.aborted) return;
+      const size = body?.size ?? body?.length ?? 0;
+      if (this.upload.onprogress) this.upload.onprogress({ lengthComputable: true, loaded: size, total: size });
+      this.status = r.status; this.responseText = await r.text(); this.readyState = 4;
+      if (this.onload) this.onload();
+    }).catch(() => { if (!this.aborted && this.onerror) this.onerror(); });
+  }
+};
 globalThis.localStorage = memory();
 globalThis.sessionStorage = memory();
 // the commands' own logging goes to stderr: stdout is the answer

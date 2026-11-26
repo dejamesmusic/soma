@@ -193,9 +193,11 @@ export default function Terminal() {
     const redrawAll = () => { for (const b of blocks) draw(b, false); scroll.scrollTop = scroll.scrollHeight; };
 
     // ---- the prompt ----
+    // the prompt bar keeps > (Nov 26, James: "slightly more intuitive and familiar"); the mark is Φ elsewhere
     const ps = () => (st.ask ? st.ask.ps : st.model ? `${ascii(st.model).slice(0, 24)}> ` : '> ');
     const syncPrompt = () => {
-      psEl.textContent = ps();
+      // at rest the prompt reads >_ ; the space comes back as you type
+      const p = ps(); psEl.textContent = !input.value && !st.ask && p.endsWith('> ') ? p.slice(0, -1) : p;
       const v = st.ask?.secret ? '*'.repeat(input.value.length) : input.value; const c = input.selectionStart ?? v.length;
       const ch = v.slice(c, c + 1);
       typedEl.textContent = v.slice(0, c);

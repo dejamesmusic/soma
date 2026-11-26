@@ -3,9 +3,32 @@
   "version": "0.1.0",
   "description": "the logOS terminal in your own: run soma models, read the live stream, script the language",
   "type": "module",
-  "bin": { "logos": "logos.mjs" },
-  "files": ["logos.mjs", "README.md"],
-  "engines": { "node": ">=18" },
+  "bin": {
+    "logos": "logos.mjs"
+  },
+  "files": [
+    "logos.mjs",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
   "license": "MIT",
-  "homepage": "https://logossoma.com"
+  "homepage": "https://logossoma.com",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dejamesmusic/soma.git",
+    "directory": "platform/cli"
+  },
+  "keywords": [
+    "logos",
+    "soma",
+    "continual-learning",
+    "terminal",
+    "cli",
+    "mcp"
+  ],
+  "bugs": {
+    "url": "https://github.com/dejamesmusic/soma/issues"
+  }
 }

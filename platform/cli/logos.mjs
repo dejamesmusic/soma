@@ -104,7 +104,8 @@ async function stream(args) {
     let d;
     try { d = await api(`/me/terminal?after=${rev}&wait=25${only ? `&${only}` : ''}`); } catch (e) { process.stderr.write(`${e.message}; again in 5s\n`); await new Promise((z) => setTimeout(z, 5000)); continue; }
     for (const b of d.blocks) {
-      if (b.echo?.text) process.stdout.write(`${paint({ t: `${b.echo.ps || ''}${b.echo.text}`, cls: 'dm' })}\n`);
+      // the stored prompt is Φ, in the site's own face; a terminal we can't set the font of shows > (Nov 26, James)
+      if (b.echo?.text) process.stdout.write(`${paint({ t: `${(b.echo.ps || '').replace('Φ', '>')}${b.echo.text}`, cls: 'dm' })}\n`);
       draw([b]);
     }
     rev = d.rev;

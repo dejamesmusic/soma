@@ -21,7 +21,7 @@ export const M = (m, show) => S('', { media: { kind: m.kind === 'video' ? 'video
 
 // strict ascii: typographic characters fold to their ascii forms, anything else becomes '?'
 const FOLD = { '‘': "'", '’': "'", '“': '"', '”': '"', '–': '-', '—': '-', '…': '...',
-  '·': '|', '→': '->', '←': '<-', '×': 'x', '≈': '~', ' ': ' ', '•': '*', '≤': '<=', '≥': '>=' };
+  '·': '|', '→': '->', '←': '<-', '×': 'x', '≈': '~', ' ': ' ', '•': '*', '≤': '<=', '≥': '>=' , 'Φ': 'Φ' };   // Φ: the mark, the one character past ascii (Nov 26)
 // symbols and emoji (the app's status marks, a pasted smiley) have no ascii form: they drop out, where an unknown
 // letter prints '?'
 const SYMBOL = /[\p{Extended_Pictographic}\p{So}←-⇿⌀-⏿■-➿️‍]\s?/gu;

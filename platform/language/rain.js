@@ -1,8 +1,8 @@
 // Rolling code (Nov 20, James): where the glass is wider than the terminal needs, past a margin, somatic core's own
 // source falls in columns. Each drop is one line of the released runtime read top to bottom; heads are bright, trails
 // fade. It stills with the monitor's motion knob or reduced motion, sleeps in a hidden tab, and draws nothing narrow.
-const HEAD = '#f2fff7';
-const TRAIL = '#9fc2ae';
+const HEAD = '#fff6e0';
+const TRAIL = '#b8a98a';
 
 export function startRain(canvas, { still = () => false } = {}) {
   const ctx = canvas.getContext?.('2d');

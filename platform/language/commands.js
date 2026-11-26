@@ -92,7 +92,50 @@ export function pathToCommand(pathname, search = '') {
   if (p === '/privacy') return 'privacy';
   if (p === '/notices') return 'notices';
   if (p === '/info') return 'info';
+  if (FOUND.includes(p.slice(1))) return p.slice(1);                  // found, never listed (Nov 26)
   return `goto ${p}`;
+}
+
+// ---------- found pages (Nov 26, James: "nothing tells you what it is. you have to find out. you want to find out.") ----
+// each poster carries one line and one of these addresses. a page says one true thing (every figure from the notebook)
+// and stops at a prompt. none is in /help, the completions or the sitemap.
+const FOUND = ['training', 'remember', 'permission', 'present'];
+const TAUS = [11, 76, 521, 3571, 24476, 167761];   // the store's six decay constants, in tokens (runtime spec)
+function presentFrame(t, c) {
+  const width = Math.max(8, Math.min(40, c - 26));
+  return [
+    ...TAUS.map((tau) => line(Dm(`${tau.toLocaleString('en').padStart(9)} tokens  `), S('#'.repeat(Math.round(width * Math.exp(-t / tau)))))),
+    blank(), line(Dm(`${Math.round(t).toLocaleString('en')} token${Math.round(t) === 1 ? '' : 's'} since`)), blank(), line(Hi('the past is present.')),
+  ];
+}
+function foundPage(ctx, word) {
+  const R = (render, sugg, after) => ({ render, path: `/${word}`, sugg, after });
+  if (word === 'training') {
+    return R(() => [line(Hi('soma-1b')), line(Dm('read      '), S('about 1.43 billion tokens')), line(Dm('learning  '), S('on')),
+      line(Dm('last read '), S('moviecorpus, 1.325 bits per byte')), blank(), line(Hi("it hasn't finished."))], ['talk to soma-1b']);
+  }
+  if (word === 'remember') {
+    return R(() => [line(Dm('a four-digit number, said once.')), line(Dm('one to three million tokens later:')), blank(),
+      line(S('  never heard it   35 bits')), line(S('  heard it once    19 bits')), blank(), line(Hi('it remembered some of it.'))],
+    ['developments where-the-evidence-stands']);
+  }
+  if (word === 'permission') {
+    return R(() => [line(Dm('MIT License')), blank(), line(Dm('Permission is hereby granted, free of charge,')),
+      line(Dm('to any person obtaining a copy ...')), blank(), line(Hi('nobody to ask.'))], ['get soma']);
+  }
+  // present: the six traces, one event fading at six rates, on a clock that speeds up so the slow ones show
+  const state = { t: 1 };
+  return R(() => [], ['runtime'], () => {
+    const b = ctx.printLive((c) => presentFrame(state.t, c));
+    let k = 0; let cycles = 0;
+    const timer = setInterval(() => {
+      if (ctx.active && !ctx.active()) { clearInterval(timer); return; }
+      k += 1; state.t = 10 ** (k * 0.055);
+      if (state.t > 1.2e6) { k = 0; cycles += 1; }
+      if (cycles >= 3 && state.t >= 3571) { state.t = 3571; clearInterval(timer); }
+      ctx.update(b, (c) => presentFrame(state.t, c));
+    }, 90);
+  });
 }
 
 // ---------- pages ----------
@@ -1477,6 +1520,7 @@ export async function run(ctx, raw) {
   // a command can be typed with a slash too ("/profile", "/developments"): outside a conversation the slash is dropped
   const t = raw.trim().replace(/^\/(?=[a-z])/i, ''); const low = t.toLowerCase(); let m;
   if (/^runpod setup$/.test(low)) return runpodSetup(ctx);      // before the cloud commands: it's for people with no account yet
+  if (FOUND.includes(low)) return foundPage(ctx, low);
   const fl = await filesCommand(ctx, t, { get, post });         // a model's files, before library's delete/rename of models
   if (fl) return fl;
   const cloud = await runCloud(ctx, t, { get, post, request, chat });
