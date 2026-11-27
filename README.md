@@ -8,7 +8,7 @@ lab notebook, the paper, and the language logOS speaks. the weights live on logO
 
 | | |
 |---|---|
-| [`runtimes/`](runtimes) | every published version, from v8 to somatic core 1.6.0. each release is a tag |
+| [`runtimes/`](runtimes) | every published version, from v8 to somatic core 1.6.1. each release is a tag |
 | [`LINEAGE.md`](LINEAGE.md) | what each version tested, what survived, and where the evidence is |
 | [`notebook/`](notebook) | the developments notebook, as published, with the evidence records |
 | [`paper/`](paper) | time is all you need: the original manuscript |
@@ -20,7 +20,7 @@ lab notebook, the paper, and the language logOS speaks. the weights live on logO
 every runtime release logOS serves is here, unpacked, at its own tag, with logOS's record of it beside the source.
 
 ```
-python3 tools/verify.py somatic-core-1.6.0
+python3 tools/verify.py somatic-core-1.6.1
 python3 tools/verify.py --all
 ```
 

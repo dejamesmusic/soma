@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Check a runtime release in this repository against what logOS publishes.
 
-    python3 tools/verify.py somatic-core-1.6.0        # a tag
+    python3 tools/verify.py somatic-core-1.6.1        # a tag
     python3 tools/verify.py --all                     # every release tag
 
 For a tag, it:
