@@ -49,6 +49,11 @@ def clip_(params, max_norm: float) -> None:
     g = [p.grad for p in params if p.grad is not None]
     if not g:
         return
+    if g[0].is_cuda:                                       # Nov 28: two multi-tensor kernels, not ~500 small ones (the
+        sq = torch.stack(torch._foreach_norm(g)).square().sum()   # 1B trainer launches kernels faster than it can)
+        coef = torch.clamp(max_norm / (sq.sqrt() + 1e-6), max=1.0)
+        torch._foreach_mul_(g, coef)
+        return
     sq = torch.stack([torch.dot(x.reshape(-1), x.reshape(-1)) for x in g]).sum()
     coef = torch.clamp(max_norm / (sq.sqrt() + 1e-6), max=1.0)
     for x in g:

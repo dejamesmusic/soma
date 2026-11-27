@@ -46,7 +46,7 @@ except ImportError:                                                     # as scr
 
 SPECIES = "somatic_core"
 RUNTIME_ID = "soma.somatic_core"
-RUNTIME_VERSION = "1.6.0"
+RUNTIME_VERSION = "1.6.1"
 SESSION_FILE = "soma_state"                                               # the control that opens a file in a session
 TRACES_SUFFIX = ".traces.jsonl"                                           # 1.5.3: a file of recorded turns, read as turns
 TRACE_SEGMENT_CHARS = 400_000
@@ -278,6 +278,7 @@ class CoreConfig:
     lanes_read: int = 0            # lanes_batch: every lane's store read in one pass too (lanes_read.py; same maths)
     lanes_store: int = 0           # lanes_batch: every lane's store update in one pass (lanes_store.py; same maths)
     lanes_read_group: int = 0      # lanes_read: lanes read this many at a time (0: all at once); bounds its working memory
+    lanes_whole: int = 1           # lanes_batch: keep the window as views of the attention's own joined keys/values (1.6.1: same values, on)
     rehearse: int = 0              # dev (Nov 10): extra learner steps per tick on reads taken before their store update
     rehearse_span: int = 1         # dev: 1 = repeat the current tick; D > 1 = each extra step on one of the last D ticks
     # how the learner is bounded (1.1): wd = AdamW decoupled weight decay on matrices, vectors clamped to +-8 (default);

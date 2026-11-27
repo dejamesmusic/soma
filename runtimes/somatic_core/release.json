@@ -1,11 +1,11 @@
 {
  "bundle": {
-  "bytes": 14640610,
-  "name": "soma-somatic-core-1.6.0.tar.gz",
-  "sha256": "eff9b03231333cacc8e879cc544851487c4c756f61a02c8f7c1cfd130f0c349c"
+  "bytes": 14643585,
+  "name": "soma-somatic-core-1.6.1.tar.gz",
+  "sha256": "c34ea66d79ed7ed7092c560ca09d1db051f6399fd13b26696e798c1973a90a6b"
  },
- "lock_digest": "103bcf3d355ec1eb8c95cca5d5496f38d04649e34eed0b49b1450b4b639fd5b1",
- "notes": "somatic core 1.6.0: lanes. many seats' chats on one model at once, on one clock: learning, store reads and updates, generation and search/run batched across lanes (24 lanes of soma-1b on an H100). training ~2x faster (lanes batched, bf16 attention, FlexAttention, TF32). one lane is the 1.5 runtime exactly.",
+ "lock_digest": "2df371e14ed366487ad1ab3ac388a53843d0d61f888525eee8c5993c8b7e63be",
+ "notes": "faster multi-lane training: less host/device waiting, split count reads, multi-tensor gradient clipping and joined attention windows on by default. about 17% more tokens/s in the measured soma-1b H100 setup (32.8k to 38.4k); not a general hardware guarantee. one lane retains the single-stream read exactly. checkpointed training also preserves the full joined window. checkpoint format unchanged; opens earlier somatic core checkpoints.",
  "opens": [
   "0.1.0",
   "0.1.1",
@@ -24,14 +24,15 @@
   "1.5.1",
   "1.5.2",
   "1.5.3",
-  "1.6.0"
+  "1.6.0",
+  "1.6.1"
  ],
  "optional_python": {
   "numba": ">=0.60",
   "pytest": ">=8",
   "wasmtime": "==50.0.1"
  },
- "released_on": "2026-11-24",
+ "released_on": "2026-11-28",
  "requires_app": "1.2.0",
  "requires_python": {
   "numpy": ">=2.0",
@@ -40,5 +41,5 @@
  },
  "runtime_id": "soma.somatic_core",
  "statement": 1,
- "version": "1.6.0"
+ "version": "1.6.1"
 }

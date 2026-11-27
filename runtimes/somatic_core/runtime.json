@@ -1,9 +1,9 @@
 {
   "protocolVersion": 1,
   "id": "soma.somatic_core",
-  "version": "1.6.0",
+  "version": "1.6.1",
   "name": "somatic core",
-  "description": "bounded continual learner: an exact context store on a phi ladder of timescales (orders 1-3, phi^5 tokens to all-time) read by a causal attention learner over the last 1024 tokens, the store injected at every block, mixed per context \u00b7 8k alphabet \u00b7 fixed rate \u00b7 nothing grows \u00b7 1.5.0: takes its turn while it reads where it predicts it; search and run, its two skills \u00b7 1.6.0: lanes, many seats' chats on one model at once",
+  "description": "bounded continual learner: an exact context store on a phi ladder of timescales (orders 1-3, phi^5 tokens to all-time) read by a causal attention learner over the last 1024 tokens, the store injected at every block, mixed per context \u00b7 8k alphabet \u00b7 fixed rate \u00b7 nothing grows \u00b7 1.5.0: takes its turn while it reads where it predicts it; search and run, its two skills \u00b7 1.6.0: lanes, many seats' chats on one model at once \u00b7 1.6.1: lanes train ~17% faster, same maths",
   "python": "/Library/Frameworks/Python.framework/Versions/3.11/bin/python3",
   "sourceRoot": "source",
   "worker": "somatic_core/somatic_train_worker.py",
@@ -43,7 +43,8 @@
       "1.5.1",
       "1.5.2",
       "1.5.3",
-      "1.6.0"
+      "1.6.0",
+      "1.6.1"
     ],
     "cursorPolicy": "resume-saved",
     "lineage": true

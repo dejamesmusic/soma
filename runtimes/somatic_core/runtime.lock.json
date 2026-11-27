@@ -1,12 +1,12 @@
 {
   "lockVersion": 1,
-  "runtime": "soma.somatic_core@1.6.0",
-  "digest": "103bcf3d355ec1eb8c95cca5d5496f38d04649e34eed0b49b1450b4b639fd5b1",
+  "runtime": "soma.somatic_core@1.6.1",
+  "digest": "2df371e14ed366487ad1ab3ac388a53843d0d61f888525eee8c5993c8b7e63be",
   "files": [
     {
       "path": "runtime.json",
-      "sha256": "6efc5501465276c5212830f2b119be97553e9dd5173fc75fb4491b8c31c0a0c1",
-      "bytes": 7814
+      "sha256": "768d462895c7488969d86227cea9f721fe50cd6546894d160e6e4a53da6de554",
+      "bytes": 7879
     },
     {
       "path": "source/requirements.txt",
@@ -25,8 +25,8 @@
     },
     {
       "path": "source/somatic_core/bounds.py",
-      "sha256": "dbaf21e4569f6f175f50f937647ff5553d5e4d0aa8266c4641d17e8eea8af8d2",
-      "bytes": 6807
+      "sha256": "7a4728290eaa15694a25694970feefd0489b9873bc48659d25c7632e1e7a97da",
+      "bytes": 7162
     },
     {
       "path": "source/somatic_core/core.py",
@@ -35,13 +35,13 @@
     },
     {
       "path": "source/somatic_core/core2.py",
-      "sha256": "bc40bcd547966159921d9d9843b322707c78f718113bb1d7e446d5187d250b62",
-      "bytes": 47012
+      "sha256": "29418229940bdbd03107e9229107b299b7d8a43bd506f1fce8ba502878f224be",
+      "bytes": 47284
     },
     {
       "path": "source/somatic_core/core3.py",
-      "sha256": "680ce519ad19dc2a325ed4ebe87dabb12ac0388f17cf994e2c3c3c86a9b9fa35",
-      "bytes": 76445
+      "sha256": "0561d78312574cb05bb801cab237ca88726d2b2126f0b502776dd2fb86b78ab0",
+      "bytes": 77910
     },
     {
       "path": "source/somatic_core/data.py",
@@ -75,8 +75,8 @@
     },
     {
       "path": "source/somatic_core/lanes.py",
-      "sha256": "aa461711f901236452c736b000686beca9f60040d1d7270771434b5edb4d356a",
-      "bytes": 15336
+      "sha256": "0bb065c2849be5539eaec80f13ffc93f0fe5d9933cee719523c592c0564d0118",
+      "bytes": 15632
     },
     {
       "path": "source/somatic_core/lanes_decode.py",
@@ -85,18 +85,18 @@
     },
     {
       "path": "source/somatic_core/lanes_read.py",
-      "sha256": "0765f62ab93cb110e8ee658f51907ad6e6fb8eadf538d1217fa64be0702c95aa",
-      "bytes": 9049
+      "sha256": "bc7623b0497ca342fb680e78dc3a2ffc6c0b484f86684ec1f1e6b23565d66f63",
+      "bytes": 11818
     },
     {
       "path": "source/somatic_core/lanes_store.py",
-      "sha256": "0585ef8112cfaa0670aec6fdcf161818ba0b62997a956d36ad0b90270b6f2818",
-      "bytes": 5836
+      "sha256": "e81b49d7800d47f003c5a7e757ce09057542624dcb07e9d85a1ac84133ba47a2",
+      "bytes": 5839
     },
     {
       "path": "source/somatic_core/runtime.py",
-      "sha256": "3a3c67208beb16f6f08f1063a7bdce252932d309be263620a93edd2cabb3f4b1",
-      "bytes": 64590
+      "sha256": "440047cde1bad01275bd125e4c4c0eff0fdeef5d50e9aef402b731a6547e7dd2",
+      "bytes": 64732
     },
     {
       "path": "source/somatic_core/sandbox/LICENSE-cpython",

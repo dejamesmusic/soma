@@ -189,12 +189,18 @@ def batched_ticks(holder, m, lanes, ms, ticks, stride=None):
         else:
             nb = len(caches[0])
             cache = [(torch.cat([c[i][0] for c in caches]), torch.cat([c[i][1] for c in caches])) for i in range(nb)]
+        whole = bool(int(m.c.get("lanes_whole", 1)))       # 1.6.1: the attention's own joined window, kept as views
         z, out = m._learner_lanes(torch.stack([p["seq"] for p in pres]),
-                                  feat_all if joint else torch.stack([p["feat"] for p in pres]), cache)
+                                  feat_all if joint else torch.stack([p["feat"] for p in pres]), cache, whole)
         outs = [(z[b], None) for b in range(B)]
         keep = m.net.ctx - (1 if m.net.slide else T)       # every lane's window, kept batched: one cat per block
-        holder._kvb = [(torch.cat([a[0], b[0]], 2)[:, :, -keep:], torch.cat([a[1], b[1]], 2)[:, :, -keep:])
-                       for a, b in zip(cache, out)] if keep > 0 else None
+        if keep <= 0:
+            holder._kvb = None
+        elif whole:
+            holder._kvb = [(k[:, :, -keep:], v[:, :, -keep:]) for k, v in out]
+        else:
+            holder._kvb = [(torch.cat([a[0], b[0]], 2)[:, :, -keep:], torch.cat([a[1], b[1]], 2)[:, :, -keep:])
+                           for a, b in zip(cache, out)]
         holder._kv_views = []
         for b, (ln, p) in enumerate(zip(lanes, pres)):
             ln._kv = [(k[b:b + 1], v[b:b + 1]) for k, v in holder._kvb] if keep > 0 else None
@@ -273,4 +279,5 @@ def _score_lanes(m, lanes, pres, z, lpE, key):
                        learner=learner[b], deep=p["deep"])
         p["lossE"], p["pf"] = -lyE[b].mean(), pf[b]
         p["feat"] = p["lpE"] = None
-    return -(lyL.mean(1) / torch.tensor([p["s_"] for p in pres], device=lyL.device)).sum()
+    from .lanes_read import _host
+    return -(lyL.mean(1) / _host([p["s_"] for p in pres], lyL.device)).sum()

@@ -9,6 +9,8 @@ indices offset into the flattened bank. The CPU parts (unique nodes, their pairs
 import numpy as np
 import torch
 
+from .lanes_read import _host
+
 
 class StoreBank:
     def __init__(self, cores):
@@ -41,13 +43,13 @@ def store_update_lanes(bank: StoreBank, items, idx=None):
     m = bank.cores[0]
     d, NB, B = m.dev, m.NB, len(idx)
     full = idx == list(range(bank.B))
-    pos = torch.tensor(idx, device=d)
+    pos = _host(idx, d)
     C = items[0]["C"]
     with torch.no_grad():
         keep = 1.0 - m.ab
         wj = keep[None, :] ** (C - torch.arange(C, device=d).float())[:, None]          # (C, NB): every lane's
         te = [it["t0"] + C for it in items]
-        dt = torch.tensor([float(t - c.r0_t) for t, c in zip(te, cores)], device=d)
+        dt = _host([float(t - c.r0_t) for t, c in zip(te, cores)], d)
         g0 = keep[None, :] ** dt[:, None]                                                 # (B, NB)
         if full:
             bank.r0 *= g0[:, :, None]

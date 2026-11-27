@@ -16,6 +16,13 @@ import torch
 from .core import LB, NE
 
 
+def _host(vals, d):
+    """a short host list on the device without draining the GPU's queue (Nov 28): torch.tensor(..., device=cuda) is a
+    blocking copy, and a blocking copy synchronises the stream, so the CPU stops running ahead (same values and dtype)"""
+    t = torch.tensor(vals)
+    return t.to(d, non_blocking=True) if d.type == "cuda" else t.to(d)
+
+
 def read_lanes(cores, items, group: int = 0):
     """group > 0: the lanes read `group` at a time (the batched read's working memory grows with the lanes), joined"""
     group = group or int(cores[0].c.get("lanes_read_group", 0))
@@ -31,15 +38,17 @@ def _read(cores, items):
     V, NB, d, K = m.V, m.NB, m.dev, m.KCH
     assert len(m.orders) == K, "lanes_read: no skip orders"
     keep = 1.0 - m.ab                                        # (NB,)
+    split = B > 1                                            # 1.6.1: lanes keep slot and in-tick parts apart (one lane:
+                                                             # the joined form, bit-identical to the single stream)
     pos = torch.arange(C, device=d)
     y = torch.stack([it["y"] for it in items])                                   # (B, C)
-    t0 = torch.tensor([it["t0"] for it in items], device=d)                      # (B,) the lanes' clocks
+    t0 = _host([it["t0"] for it in items], d)                                     # (B,) the lanes' clocks
     with torch.no_grad():
         lag = (pos[:, None] - pos[None, :]).float()
         lower = (lag > 0).float()
         W0 = keep[None, None, :] ** lag.clamp(min=0)[..., None] * lower[..., None]
         W0 = W0.permute(0, 2, 1).contiguous()                                     # (C, NB, C) [i, b, j], every lane's
-        r0t = torch.tensor([c.r0_t for c in cores], device=d)
+        r0t = _host([c.r0_t for c in cores], d)
         f0 = keep[None, None, :] ** ((t0 - r0t)[:, None].float() + pos.float()[None, :])[..., None]  # (B, C, NB)
         n0 = torch.stack([c.n0 for c in cores])                                   # (B, NB)
         n0i = f0 * n0[:, None, :] + W0.sum(-1)[None]                              # (B, C, NB)
@@ -65,8 +74,15 @@ def _read(cores, items):
             F = torch.nn.functional.one_hot(first, C).float()                                  # (B, C, C)
             # (B, C*NB, C) @ (B, C, C): one batched product per tick (F[:, None] broadcast it into B*C tiny ones)
             A = torch.bmm((Wk * (1 - ins)[:, None, None, :]).reshape(B, C * NB, C), F).reshape(B, C, NB, C)
-            toks.append(torch.cat([M, y[:, None, :].expand(B, C, C)], 2))                       # (B, C, K+1+C)
-            vals.append(torch.cat([R, A], 3))                                                   # (B, C, NB, K+1+C)
+            # Nov 28 (throughput): the slot part (R at M) and the in-tick part (A at the tick's own tokens y) stay
+            # apart; joined, order 1's was a 600 MB copy a round, and every order scattered A onto the vocabulary
+            # separately though y is the same for all of them. Same sums.
+            if split:
+                toks.append(M)                                                                  # (B, C, K+1)
+                vals.append((R, A))                                                             # (B, C, NB, K+1), (B, C, NB, C)
+            else:                                          # one lane: joined, exactly as the single stream reads
+                toks.append(torch.cat([M, y[:, None, :].expand(B, C, C)], 2))                   # (B, C, K+1+C)
+                vals.append(torch.cat([R, A], 3))                                               # (B, C, NB, K+1+C)
             Ns.append(N)
         hs, gs = _chain(vals, Ns, NB, d)
         coef = [None] * K
@@ -78,10 +94,20 @@ def _read(cores, items):
         a0 = G0 / (n0i + 1.0)
         R0 = torch.stack([c.r0 for c in cores])                                   # (B, NB, V)
         P = torch.addcmul((a0 / V)[..., None], (a0 * f0)[..., None], R0[:, None])  # (B, C, NB, V)
-        P.scatter_add_(3, y[:, None, None, :].expand(B, C, NB, C), W0[None] * a0[..., None])
-        for k in range(K):
-            T = toks[k].shape[2]
-            P.scatter_add_(3, toks[k][:, :, None, :].expand(B, C, NB, T), vals[k] * coef[k][..., None])
+        if split:
+            tick = W0[None] * a0[..., None]                                                  # (B, C, NB, C): at y
+            for k in range(K):
+                R, A = vals[k]
+                T = toks[k].shape[2]
+                P.scatter_add_(3, toks[k][:, :, None, :].expand(B, C, NB, T), R * coef[k][..., None])
+                tick = tick + A * coef[k][..., None]
+            P.scatter_add_(3, y[:, None, None, :].expand(B, C, NB, C), tick)                # every order's, once
+            del tick
+        else:
+            P.scatter_add_(3, y[:, None, None, :].expand(B, C, NB, C), W0[None] * a0[..., None])
+            for k in range(K):
+                T = toks[k].shape[2]
+                P.scatter_add_(3, toks[k][:, :, None, :].expand(B, C, NB, T), vals[k] * coef[k][..., None])
         LP = P.clamp_min_(1e-30).log_()
         del P
         deep = torch.stack([(n0i[..., -1] > 0).long() * 0] + [(Ns[k][..., -1] > 0).long() * (k + 1) for k in range(K)],
@@ -109,8 +135,13 @@ def _chain(vals, Ns, NB, d):
     hs, gs = [], []
     last = (torch.arange(NB, device=d) == NB - 1)
     for v, N in zip(vals, Ns):
-        dist = (v > 0.05).sum(-1).float()
-        lost = torch.clamp(N - v.sum(-1), min=0.0)
+        if isinstance(v, tuple):
+            R, A = v
+            dist = ((R > 0.05).sum(-1) + (A > 0.05).sum(-1)).float()
+            lost = torch.clamp(N - (R.sum(-1) + A.sum(-1)), min=0.0)
+        else:
+            dist = (v > 0.05).sum(-1).float()
+            lost = torch.clamp(N - v.sum(-1), min=0.0)
         bt = torch.where(last, dist.clamp(min=1.0), dist + 1.0)
         h = 1.0 / (N + bt)
         hs.append(h)
@@ -126,7 +157,11 @@ def _feat(m, pk):
     X0 = (f0[..., None] * (R0 @ Pm)[:, None] + Pm.sum(0) / V
           + torch.matmul(W0.reshape(C * NB, C)[None], Pm.index_select(0, y.reshape(-1)).reshape(B, C, -1)).reshape(B, C, NB, -1)
           ) / (n0i + 1.0)[..., None]
-    Xs = [_succ(m, vals[k], toks[k], Pm) for k in range(K)]                        # (B, C, NB, DP)
+    if isinstance(vals[0], tuple):
+        Py = Pm.index_select(0, y.reshape(-1)).reshape(B, C, -1)                   # (B, C, DP): the tick's tokens
+        Xs = [_succ(m, vals[k][0], toks[k], Pm) + _tick(m, vals[k][1], Py) for k in range(K)]   # (B, C, NB, DP)
+    else:
+        Xs = [_succ(m, vals[k], toks[k], Pm) for k in range(K)]
     fs = [torch.cat([X0, torch.log1p(n0i)[..., None]], -1)]
     for L in range(1, K + 1):
         run = torch.ones(B, C, NB, device=d)
@@ -139,10 +174,19 @@ def _feat(m, pk):
     return torch.stack(fs, 2)                                                     # (B, C, O, NB, DP+1)
 
 
+def _tick(m, A, Py):
+    """the in-tick counts' features: A (B, C, NB, C) at the tick's tokens, whose projections are Py (B, C, DP)"""
+    B, C, NB, _ = A.shape
+    if A.is_cuda and int(m.c.get("feat_bf16", 0)):
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            return torch.bmm(A.reshape(B, C * NB, C), Py).float().reshape(B, C, NB, -1)
+    return torch.bmm(A.reshape(B, C * NB, C), Py).reshape(B, C, NB, -1)
+
+
 def _succ(m, v, t, Pm):
     B, C, NB, T = v.shape
     V, DP = Pm.shape
-    if T * DP <= NB * V or not int(m.c.get("feat_scatter", 1)):
+    if (T * DP <= NB * V and not (v.is_cuda and B > 1)) or not int(m.c.get("feat_scatter", 1)):   # lanes on cuda: scatter
         return torch.einsum("zibt,zitd->zibd", v, Pm.index_select(0, t.reshape(-1)).reshape(B, C, T, DP))
     A = torch.zeros(B, C, NB, V, device=v.device, dtype=v.dtype)
     A.scatter_add_(3, t[:, :, None, :].expand(B, C, NB, T), v)

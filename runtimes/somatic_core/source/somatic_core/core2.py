@@ -112,7 +112,7 @@ class AttnBlock(torch.nn.Module):
         x = x + self.o(a)
         return x + self.f2(torch.nn.functional.gelu(self.f1(self.l2(x))))
 
-    def forward_cache(self, x, ck, cv, cos, sin, win=0):
+    def forward_cache(self, x, ck, cv, cos, sin, win=0, whole=False):
         """att_cache (Nov 18; James: "the store/count/window all observe the same now"): x holds only this tick's
         positions; ck/cv are the earlier positions' keys (un-rotated) and values, computed once, at their own tick, and
         read here without recomputation or gradient. Returns x and this tick's own keys/values for the cache."""
@@ -135,6 +135,8 @@ class AttnBlock(torch.nn.Module):
             m = (kj <= qi) & (kj > qi - win) if win else kj <= qi              # win: exactly win positions per query
             a = torch.nn.functional.scaled_dot_product_attention(qr, kr, va, attn_mask=m)
         x = x + self.o(a.transpose(1, 2).reshape(B, C, H))
+        if whole:                                          # Nov 28: the joined window, so lanes needn't join it again
+            return x + self.f2(torch.nn.functional.gelu(self.f1(self.l2(x)))), ka, va
         return x + self.f2(torch.nn.functional.gelu(self.f1(self.l2(x)))), k, v
 
     def forward_kv(self, x, kv, cos=None, sin=None, n=0, win=0):
@@ -266,7 +268,7 @@ class Learner3(torch.nn.Module):
             self.h = h
         return self.out(h)
 
-    def forward_lanes(self, seq, feat, cache):
+    def forward_lanes(self, seq, feat, cache, whole=False):
         """B lanes' ticks in one pass (Nov 24, throughput; lanes.py): seq (B, C) inputs, feat (B, C, ...) store features,
         cache = [(K, V)] per block with K (B, heads, Lk, d), or None. The same maths as _forward_cached for each lane
         (one lane: identical); the weights don't change within a round, so the lanes' graphs are one graph.
@@ -288,9 +290,9 @@ class Learner3(torch.nn.Module):
             kv = cache[i] if cache else (None, None)
             if ck:
                 x, k, v = torch.utils.checkpoint.checkpoint(b.forward_cache, x, kv[0], kv[1], self.rcos, self.rsin,
-                                                            self.slide, use_reentrant=False)
+                                                            self.slide, whole, use_reentrant=False)
             else:
-                x, k, v = b.forward_cache(x, kv[0], kv[1], self.rcos, self.rsin, self.slide)
+                x, k, v = b.forward_cache(x, kv[0], kv[1], self.rcos, self.rsin, self.slide, whole)
             out.append((k.detach(), v.detach()))
         return self.out(self.ln_f(x)), out
 
@@ -668,13 +670,13 @@ class Core2(_Core):
             return z.float()
         return self.net(wt, feat)
 
-    def _learner_lanes(self, seq, feat, cache):
+    def _learner_lanes(self, seq, feat, cache, whole=False):
         """forward_lanes under the same autocast as _learner -> (logits fp32 (B, C, V), this tick's [(K, V)])"""
         if self.dev.type == "cuda" and int(self.c.get("learner_bf16", 0)):
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                z, out = self.net.forward_lanes(seq, feat, cache)
+                z, out = self.net.forward_lanes(seq, feat, cache, whole)
             return z.float(), out
-        return self.net.forward_lanes(seq, feat, cache)
+        return self.net.forward_lanes(seq, feat, cache, whole)
 
     def _maps2(self, ids):
         out = {}

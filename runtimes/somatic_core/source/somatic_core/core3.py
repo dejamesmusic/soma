@@ -316,6 +316,16 @@ class _PairRows:
         return self.o.pc[self.k][self.o._pidmap[self.k]].permute(0, 2, 1)       # (C, NB, K+1)
 
 
+_COPY_STREAMS = {}
+
+
+def _copy_stream(dev):
+    """one side stream per device for host-to-device copies (Nov 28)"""
+    if dev not in _COPY_STREAMS:
+        _COPY_STREAMS[dev] = torch.cuda.Stream(dev)
+    return _COPY_STREAMS[dev]
+
+
 class Core3(Core2):
     _dense_slots = False                                  # never allocate core.py's dense slot tensors (startup spike)
 
@@ -380,13 +390,30 @@ class Core3(Core2):
             for k in self.orders:                           # compiled, int32 across, widened on the device (Nov 18)
                 S = self.slots[k]
                 C = ids.shape[1]
-                M = np.empty((C, S.K + 1), np.int32)
-                Pm = np.empty((C, S.K + 1), np.int32)
-                jit.maps_tick(S.ptab, S.ptok, S.ppid, S.R, S.K, self.NPk[k], np.ascontiguousarray(ids[k - 1], np.int64), M, Pm)
-                Mt = self._dv(M).long()
+                if self.dev.type == "cuda" and self.transfers == "queued":
+                    # Nov 28: written straight into pinned memory, so the copy is DMA, queued behind the GPU's work,
+                    # with no CPU staging copy (the maps are ~20 MB a lane-tick); same values
+                    Mh = torch.empty((C, S.K + 1), dtype=torch.int32, pin_memory=True)
+                    Ph = torch.empty((C, S.K + 1), dtype=torch.int32, pin_memory=True)
+                    jit.maps_tick(S.ptab, S.ptok, S.ppid, S.R, S.K, self.NPk[k], np.ascontiguousarray(ids[k - 1], np.int64),
+                                  Mh.numpy(), Ph.numpy())
+                    main = torch.cuda.current_stream(self.dev)
+                    cs = _copy_stream(self.dev)                # the copies run beside the compute, not in its queue
+                    with torch.cuda.stream(cs):
+                        Md = Mh.to(self.dev, non_blocking=True)
+                        Pd = Ph.to(self.dev, non_blocking=True)
+                    main.wait_stream(cs)
+                    Md.record_stream(main); Pd.record_stream(main)
+                    Mt = Md.long()
+                    self._pidmap[k] = Pd.long()
+                else:
+                    M = np.empty((C, S.K + 1), np.int32)
+                    Pm = np.empty((C, S.K + 1), np.int32)
+                    jit.maps_tick(S.ptab, S.ptok, S.ppid, S.R, S.K, self.NPk[k], np.ascontiguousarray(ids[k - 1], np.int64), M, Pm)
+                    Mt = self._dv(M).long()
+                    self._pidmap[k] = self._dv(Pm).long()
                 out[f"v{k}"] = Mt >= 0
                 out[k] = Mt.clamp(min=0)
-                self._pidmap[k] = self._dv(Pm).long()
             return out
         for k in self.orders:
             S = self.slots[k]
