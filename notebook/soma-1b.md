@@ -6,7 +6,7 @@ james blight · 2026-11-28 · version 2 · result · verdict: alive
 
 editorial review 28 november 2026, for this specific notebook version. the original title and experiment text below are historical.
 
-evaluation protocol: **frozen_held_out, online_held_out**. one seed each, one dataset, one size; equal tokens, not equal compute (1.66x the transformer's time per token today); the transformer sees one 1,024-token window at a time; longer-context or cached transformers are untested; from an empty store with weights frozen, soma-1b scored worse than the transformer; the held-out test used the pretrained checkpoint, not the 2.4-billion-token model; scores of reads after release and of the second billion are training-stream scores, not held-out; the 28 november trainer speed is measured, not yet in a published runtime.
+evaluation protocol: **frozen_held_out, online_held_out**. one seed each, one dataset, one size; equal tokens, not equal compute (1.66x the transformer's time per token today); the transformer sees one 1,024-token window at a time; longer-context or cached transformers are untested; from an empty store with weights frozen, soma-1b scored worse than the transformer; the held-out test used the pretrained checkpoint, not the 2.4-billion-token model; scores of reads after release and of the second billion are training-stream scores, not held-out; the runtime 1.6.1 speed is a short timing measurement on one h100 sxm configuration, not a sustained scale guarantee.
 
 cost/accounting scope: equal training tokens, not equal compute; on the same H100 SXM the 28 november trainer takes 1.66x the transformer's time per token (same maths as the published runtime; parity checked at full size).
 
